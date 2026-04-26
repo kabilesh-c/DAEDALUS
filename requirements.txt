@@ -1,0 +1,19 @@
+# --- OpenEnv (mandatory hackathon requirement) ---
+openenv-core>=0.2.3
+
+# --- Server / API ---
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.0.0
+numpy>=1.24.0
+
+# --- AI Designer inference (loads kabilesh-c/daedalus-designer) ---
+torch>=2.1.0
+transformers>=4.45.0
+peft>=0.13.0
+accelerate>=0.30.0
+huggingface_hub>=0.24.0
+
+# --- Training only (uncomment when retraining) ---
+# trl>=0.12.0
+# datasets>=3.0.0

@@ -1,0 +1,479 @@
+/* ═══════════════════════════════════════════════════════════════
+   DAEDALUS — Simulation Engine (Dashboard Edition)
+   Full auction simulation with 8 adversarial agents
+   ═══════════════════════════════════════════════════════════════ */
+
+const COLORS = { truthful:'#10b981', shader:'#f59e0b', colluder:'#f43f5e', dropout:'#7c3aed', exploiter:'#3b82f6' };
+const LABELS = { truthful:'Truthful', shader:'Shader', colluder:'Colluder', dropout:'Dropout', exploiter:'Exploiter' };
+const MAX_ROUNDS = 50;
+
+let S = null; // Simulation state
+let autoId = null;
+let charts = {};
+let aiMode = false;
+
+// ── Tab Switching ────────────────────────────────────
+function switchTab(id) {
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('panel-' + id).classList.add('active');
+  if (event) event.target.classList.add('active');
+  document.getElementById('sim-controls').style.display = id === 'sim' ? 'flex' : 'none';
+  if (id === 'sim') setTimeout(resizeCharts, 50);
+}
+
+function toggleAIMode() {
+  aiMode = !aiMode;
+  const btn = document.getElementById('btn-ai-mode');
+  const dot = document.getElementById('ai-status-dot');
+  if (aiMode) {
+    btn.innerHTML = `<span id="ai-status-dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--cyan); margin-right:8px; box-shadow: 0 0 8px var(--cyan);"></span> AI Active`;
+    btn.classList.add('active-ai');
+  } else {
+    btn.innerHTML = `<span id="ai-status-dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--t4); margin-right:8px;"></span> Enable AI Mode`;
+    btn.classList.remove('active-ai');
+  }
+}
+
+// ── Agent Factory ────────────────────────────────────
+function makeAgents() {
+  return [
+    { id:0, n:'A1', t:'truthful',  v:0, bid:0, sur:0, on:true, bud:Infinity, shade:0, wins:0 },
+    { id:1, n:'A2', t:'truthful',  v:0, bid:0, sur:0, on:true, bud:Infinity, shade:0, wins:0 },
+    { id:2, n:'A3', t:'shader',    v:0, bid:0, sur:0, on:true, bud:Infinity, shade:0.15, wins:0 },
+    { id:3, n:'A4', t:'shader',    v:0, bid:0, sur:0, on:true, bud:Infinity, shade:0.18, wins:0 },
+    { id:4, n:'A5', t:'colluder',  v:0, bid:0, sur:0, on:true, bud:Infinity, shade:0, wins:0, partner:5, turn:false },
+    { id:5, n:'A6', t:'colluder',  v:0, bid:0, sur:0, on:true, bud:Infinity, shade:0, wins:0, partner:4, turn:true },
+    { id:6, n:'A7', t:'dropout',   v:0, bid:0, sur:0, on:true, bud:Infinity, shade:0, wins:0, thresh:0.08, cumSur:0 },
+    { id:7, n:'A8', t:'exploiter', v:0, bid:0, sur:0, on:true, bud:2.5, shade:0, wins:0 },
+  ];
+}
+
+function readMech() {
+  return {
+    auction: document.getElementById('ctrl-auction').value,
+    revReserve: document.getElementById('t-reserve').classList.contains('active'),
+    revClearing: document.getElementById('t-clearing').classList.contains('active'),
+    revWinner: document.getElementById('t-winner').classList.contains('active'),
+    revBids: document.getElementById('t-bids').classList.contains('active'),
+    revDist: document.getElementById('t-dist').classList.contains('active'),
+    reserve: parseFloat(document.getElementById('ctrl-reserve').value),
+    penShill: parseFloat(document.getElementById('ctrl-shill').value),
+    penWithdraw: parseFloat(document.getElementById('ctrl-withdraw').value),
+    penCollusion: parseFloat(document.getElementById('ctrl-collusion').value),
+    coalition: document.getElementById('ctrl-coalition').value,
+  };
+}
+
+// ── Init ─────────────────────────────────────────────
+function initSim() {
+  S = {
+    round: 0,
+    agents: makeAgents(),
+    mech: readMech(),
+    hist: { w:[], f:[], p:[], s:[], c:[], prices:[] },
+    winner: -1,
+    clearPrice: 0,
+    timeline: [],
+    lastMech: null,
+    colRot: 0,
+  };
+  refreshVals();
+  render();
+  updateMetrics();
+  initCharts();
+  renderTimeline();
+}
+
+function refreshVals() {
+  S.agents.forEach(a => {
+    if (!a.on) return;
+    const ranges = { truthful:[0.3,0.6], shader:[0.4,0.5], colluder:[0.35,0.5], dropout:[0.15,0.45], exploiter:[0.2,0.4] };
+    const [lo, span] = ranges[a.t];
+    a.v = lo + Math.random() * span;
+  });
+}
+
+// ── Step ─────────────────────────────────────────────
+async function stepSim() {
+  if (!S || S.round >= MAX_ROUNDS) return;
+  
+  let m;
+  if (aiMode) {
+    // 🧠 Using the AI Designer back-end
+    const obs = { 
+        round_number: S.round,
+        market_outcomes: S.hist.w.map((w, i) => ({
+            welfare_ratio: w,
+            gini_coefficient: 1 - S.hist.f[i],
+            participation_rate: S.hist.p[i],
+            composite_reward: S.hist.c[i]
+        }))
+    };
+    try {
+        const res = await fetch('/api/design', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(obs)
+        });
+        m = await res.json();
+        applyMechToUI(m); // Reflect AI choice in the sliders
+    } catch (e) {
+        console.error("AI Mode failed, falling back to manual:", e);
+        m = readMech();
+    }
+  } else {
+    m = readMech();
+  }
+
+  S.mech = m;
+  S.round++;
+  refreshVals();
+
+  const active = S.agents.filter(a => a.on);
+  const n = active.length;
+
+  // Compute bids
+  S.agents.forEach(a => {
+    if (!a.on) { a.bid = 0; return; }
+    switch (a.t) {
+      case 'truthful':
+        a.bid = a.v;
+        break;
+      case 'shader': {
+        if (m.auction === 'first_price') {
+          let sf = (n - 1) / Math.max(n, 2);
+          if (m.revClearing) sf -= 0.03;
+          if (m.revBids) sf -= 0.05;
+          if (S.hist.prices.length > 2) {
+            const avg = S.hist.prices.slice(-5).reduce((s,x)=>s+x,0) / Math.min(S.hist.prices.length, 5);
+            if (avg < a.v * 0.7) sf -= 0.05;
+          }
+          a.shade = 1 - sf;
+          a.bid = a.v * sf;
+        } else {
+          a.shade = 0.02 + Math.random() * 0.03;
+          a.bid = a.v * (1 - a.shade);
+        }
+        break;
+      }
+      case 'colluder': {
+        const shouldWin = (S.colRot % 2 === 0) === a.turn;
+        const canCol = m.coalition === 'allow' || (m.coalition === 'restrict' && Math.random() > 0.5);
+        const risk = m.penCollusion > 1 ? 0.4 : 0;
+        if (canCol && Math.random() > risk) {
+          if (m.revWinner) {
+            a.bid = shouldWin ? m.reserve + 0.01 : m.reserve * 0.3;
+          } else {
+            a.bid = shouldWin ? Math.min(a.v, Math.max(m.reserve + 0.02 + Math.random()*0.05, a.v*0.5)) : m.reserve * 0.5;
+          }
+        } else {
+          a.bid = a.v * (m.auction === 'first_price' ? 0.85 : 0.98);
+        }
+        break;
+      }
+      case 'dropout': {
+        const es = a.v - m.reserve - 0.05;
+        a.cumSur += es > 0 ? es * 0.1 : -0.02;
+        if (a.cumSur < -a.thresh || m.reserve > a.v * 0.9) {
+          a.on = false; a.bid = 0;
+        } else {
+          a.bid = a.v * (m.auction === 'first_price' ? 0.9 : 1.0);
+        }
+        break;
+      }
+      case 'exploiter': {
+        if (a.bud <= 0) { a.on = false; a.bid = 0; }
+        else {
+          const agg = a.bud > 1.5 ? 0.6 : 0.3;
+          a.bid = Math.min(a.v * agg, a.bud * 0.3);
+        }
+        break;
+      }
+    }
+    if (a.on && a.bid < m.reserve) a.bid = 0;
+  });
+
+  // Allocation & Payment
+  const valid = S.agents.filter(a => a.on && a.bid >= m.reserve);
+  valid.sort((a, b) => b.bid - a.bid);
+  let winner = null, payment = 0;
+
+  if (valid.length > 0) {
+    winner = valid[0];
+    switch (m.auction) {
+      case 'first_price': payment = winner.bid; break;
+      case 'second_price': case 'vcg': payment = valid.length > 1 ? valid[1].bid : m.reserve; break;
+    }
+    winner.sur = winner.v - payment;
+    winner.wins++;
+    if (winner.t === 'exploiter') winner.bud -= payment;
+    if (m.penCollusion > 0 && winner.t === 'colluder') {
+      const p = S.agents[winner.partner];
+      if (p && p.on && p.bid < m.reserve * 0.8) winner.sur -= payment * m.penCollusion * 0.3;
+    }
+  }
+
+  S.winner = winner ? winner.id : -1;
+  S.clearPrice = payment;
+  S.colRot++;
+
+  // Metrics
+  const met = calcMetrics(winner);
+  S.hist.w.push(met.w); S.hist.f.push(met.f); S.hist.p.push(met.p); S.hist.s.push(met.s);
+  S.hist.c.push(met.c); S.hist.prices.push(payment);
+
+  // Adapt agents
+  adaptAgents();
+
+  // Render
+  render();
+  updateMetrics();
+  updateCharts();
+  updateTimeline(m);
+  document.getElementById('round-badge').textContent = `Round ${S.round} / ${MAX_ROUNDS}`;
+  document.getElementById('comp-badge').textContent = `R = ${met.c.toFixed(3)}`;
+  document.getElementById('comp-badge').style.color = met.c > 0.3 ? 'var(--emerald)' : met.c > 0.1 ? 'var(--amber)' : 'var(--rose)';
+}
+
+function calcMetrics(winner) {
+  const all = S.agents;
+  const active = all.filter(a => a.on);
+  const vals = all.map(a => a.v).sort((a,b) => b-a);
+  const maxW = vals[0] || 1;
+  const w = winner ? Math.min(winner.v / maxW, 1) : 0;
+  const surp = active.map(a => Math.max(a.sur, 0));
+  const f = 1 - gini(surp);
+  const p = active.length / all.length;
+  let s = 1;
+  if (S.hist.w.length >= 5) {
+    const rec = S.hist.w.slice(-5);
+    const mu = rec.reduce((a,b)=>a+b,0) / rec.length;
+    const sd = Math.sqrt(rec.reduce((a,b)=>a+(b-mu)**2,0) / rec.length);
+    s = Math.max(0, 1 - sd * 3);
+  }
+  return { w, f, p, s, c: w*f*p*s };
+}
+
+function gini(vals) {
+  if (!vals.length) return 0;
+  const sorted = [...vals].sort((a,b) => a-b);
+  const n = sorted.length;
+  const sum = sorted.reduce((a,b) => a+b, 0);
+  if (sum === 0) return 0;
+  let num = 0;
+  for (let i = 0; i < n; i++) num += (2*(i+1)-n-1) * sorted[i];
+  return num / (n * sum);
+}
+
+function adaptAgents() {
+  S.agents.forEach(a => {
+    if (!a.on) {
+      // Dropout re-entry check
+      if (a.t === 'dropout' && S.hist.p.length > 3) {
+        const rp = S.hist.p.slice(-3);
+        if (rp.reduce((s,x)=>s+x,0)/3 > 0.6 && S.mech.reserve < 0.3) {
+          a.on = true; a.cumSur = 0;
+        }
+      }
+      return;
+    }
+    if (a.t === 'shader') {
+      a.shade = S.winner === a.id ? Math.min(a.shade + 0.01, 0.35) : Math.max(a.shade - 0.005, 0.02);
+    }
+    if (a.t === 'colluder' && S.mech.penCollusion > 1.5) {
+      a.shade = Math.min(a.shade + 0.02, 0.5);
+    }
+  });
+}
+
+// ── Render Agents ────────────────────────────────────
+function render() {
+  const grid = document.getElementById('arena-grid');
+  grid.innerHTML = '';
+  S.agents.forEach(a => {
+    const col = COLORS[a.t];
+    const bidPct = Math.min(a.bid * 100, 100);
+    const valPct = Math.min(a.v * 100, 100);
+    const isWin = S.winner === a.id;
+    const div = document.createElement('div');
+    div.className = `agent-cell${isWin ? ' winner' : ''}${!a.on ? ' out' : ''}`;
+    div.innerHTML = `
+      <div class="agent-dot" style="background:${col}">${a.n}</div>
+      <div class="agent-label">${LABELS[a.t]}</div>
+      <div class="agent-status" style="color:${isWin ? 'var(--cyan)' : a.on ? 'var(--t4)' : 'var(--rose)'}">
+        ${isWin ? '🏆 WIN' : a.on ? 'ACTIVE' : '❌ OUT'}
+      </div>
+      ${a.t === 'colluder' ? '<div class="paired-tag">🔗 paired</div>' : ''}
+      <div class="bid-wrap">
+        <div class="val-line" style="bottom:${valPct}%"></div>
+        <div class="bid-fill" style="height:${bidPct}%;background:${col}30;border-left:2px solid ${col}"></div>
+      </div>
+      <div class="bid-nums">
+        <span class="bn-bid" style="color:${col}">${a.on ? a.bid.toFixed(3) : '—'}</span>
+        <span class="bn-val">v:${a.v.toFixed(2)}</span>
+      </div>`;
+    grid.appendChild(div);
+  });
+}
+
+function updateMetrics() {
+  const r = S.round;
+  const w = r > 0 ? S.hist.w[r-1] : 0;
+  const f = r > 0 ? S.hist.f[r-1] : 0;
+  const p = r > 0 ? S.hist.p[r-1] : 0;
+  const s = r > 0 ? S.hist.s[r-1] : 0;
+  const c = r > 0 ? S.hist.c[r-1] : 0;
+  document.getElementById('mv-w').textContent = w.toFixed(2);
+  document.getElementById('mv-f').textContent = f.toFixed(2);
+  document.getElementById('mv-p').textContent = p.toFixed(2);
+  document.getElementById('mv-s').textContent = s.toFixed(2);
+  document.getElementById('mb-w').style.width = `${w*100}%`;
+  document.getElementById('mb-f').style.width = `${f*100}%`;
+  document.getElementById('mb-p').style.width = `${p*100}%`;
+  document.getElementById('mb-s').style.width = `${s*100}%`;
+  document.getElementById('comp-val').textContent = c.toFixed(3);
+}
+
+// ── Charts ───────────────────────────────────────────
+function initCharts() {
+  ['w','f','p'].forEach(k => {
+    const canvas = document.getElementById('ch-' + k);
+    charts[k] = { canvas, ctx: canvas.getContext('2d'), key: k };
+  });
+  resizeCharts();
+}
+
+function resizeCharts() {
+  Object.values(charts).forEach(ch => {
+    if (!ch.canvas) return;
+    const rect = ch.canvas.parentElement.getBoundingClientRect();
+    ch.canvas.width = Math.max(rect.width, 100);
+    ch.canvas.height = Math.max(rect.height - 16, 30);
+    drawChart(ch);
+  });
+}
+
+function drawChart(ch) {
+  const { canvas: cv, ctx, key } = ch;
+  const colors = { w:'#10b981', f:'#7c3aed', p:'#f59e0b' };
+  const col = colors[key];
+  const data = S.hist[key];
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  // Grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) { ctx.beginPath(); ctx.moveTo(0, H/4*i); ctx.lineTo(W, H/4*i); ctx.stroke(); }
+  if (data.length < 2) return;
+  const sx = W / Math.max(MAX_ROUNDS - 1, 1);
+  // Area
+  ctx.beginPath(); ctx.moveTo(0, H);
+  data.forEach((v, i) => ctx.lineTo(i * sx, H - v * H));
+  ctx.lineTo((data.length-1)*sx, H); ctx.closePath();
+  ctx.fillStyle = col + '12'; ctx.fill();
+  // Line
+  ctx.beginPath();
+  data.forEach((v, i) => { if (i===0) ctx.moveTo(0, H-v*H); else ctx.lineTo(i*sx, H-v*H); });
+  ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.stroke();
+  // Dot
+  const last = data[data.length-1];
+  ctx.beginPath(); ctx.arc((data.length-1)*sx, H-last*H, 3, 0, Math.PI*2);
+  ctx.fillStyle = col; ctx.fill();
+}
+
+function updateCharts() { Object.values(charts).forEach(ch => ch && drawChart(ch)); }
+
+// ── Timeline ─────────────────────────────────────────
+function updateTimeline(m) {
+  const prev = S.lastMech;
+  let desc = null;
+  if (!prev) { desc = `Init: ${m.auction.replace('_','-')}`; }
+  else {
+    const ch = [];
+    if (prev.auction !== m.auction) ch.push(`Auction→${m.auction.replace('_','-')}`);
+    if (Math.abs(prev.reserve - m.reserve) > 0.02) ch.push(`Reserve${m.reserve>prev.reserve?'↑':'↓'}${m.reserve.toFixed(2)}`);
+    if (prev.revWinner !== m.revWinner) ch.push(`Winner ${m.revWinner?'shown':'hidden'}`);
+    if (prev.penCollusion !== m.penCollusion) ch.push(`ColPen→${m.penCollusion.toFixed(1)}`);
+    if (prev.coalition !== m.coalition) ch.push(`Coalition→${m.coalition}`);
+    if (ch.length) desc = ch.join(', ');
+  }
+  S.lastMech = { ...m };
+  if (desc) {
+    const c = S.hist.c;
+    const cur = c[c.length-1] || 0;
+    const pre = c.length > 1 ? c[c.length-2] : cur;
+    S.timeline.push({ round:S.round, action:desc, delta:cur-pre, comp:cur });
+    renderTimeline();
+  }
+}
+
+function renderTimeline() {
+  const el = document.getElementById('timeline');
+  el.innerHTML = '';
+  S.timeline.slice(-12).forEach(e => {
+    const cls = e.delta > 0.01 ? 'pos' : e.delta < -0.01 ? 'neg' : '';
+    el.innerHTML += `<div class="t-event"><div class="t-round">R${e.round}</div><div class="t-action">${e.action}</div><div class="t-impact ${cls}">${e.delta>=0?'+':''}${e.delta.toFixed(3)} → ${e.comp.toFixed(3)}</div></div>`;
+  });
+  el.scrollLeft = el.scrollWidth;
+}
+
+// ── Controls ─────────────────────────────────────────
+function togChip(el) { el.classList.toggle('active'); }
+function onCtrlChange() { /* applied on next step */ }
+
+function applyMechToUI(m) {
+  if (!m) return;
+  if (m.auction_type) document.getElementById('ctrl-auction').value = m.auction_type;
+  if (m.reserve_price !== undefined) {
+    document.getElementById('ctrl-reserve').value = m.reserve_price;
+    document.getElementById('sv-reserve').textContent = m.reserve_price.toFixed(2);
+  }
+  if (m.shill_penalty !== undefined) {
+    document.getElementById('ctrl-shill').value = m.shill_penalty;
+    document.getElementById('sv-shill').textContent = m.shill_penalty.toFixed(1);
+  }
+  if (m.coalition_policy) document.getElementById('ctrl-coalition').value = m.coalition_policy;
+  
+  // Set toggle chips
+  const chips = { 
+    't-reserve': m.reveal_reserve, 
+    't-clearing': m.reveal_clearing_price, 
+    't-winner': m.reveal_winner_identity, 
+    't-bids': m.reveal_competing_bids, 
+    't-dist': m.reveal_bid_distribution 
+  };
+  for (let id in chips) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    if (chips[id]) el.classList.add('active'); else el.classList.remove('active');
+  }
+}
+
+function toggleAuto() {
+  const btn = document.getElementById('btn-auto');
+  if (autoId) {
+    clearInterval(autoId); autoId = null;
+    btn.textContent = '▶ Auto'; btn.className = 'h-btn h-btn-secondary';
+  } else {
+    autoId = setInterval(async () => {
+      if (S.round >= MAX_ROUNDS) { clearInterval(autoId); autoId = null; btn.textContent = '▶ Auto'; btn.className = 'h-btn h-btn-secondary'; return; }
+      await stepSim();
+    }, 400);
+    btn.textContent = '⏸ Pause'; btn.className = 'h-btn h-btn-primary';
+  }
+}
+
+function resetSim() {
+  if (autoId) { clearInterval(autoId); autoId = null; document.getElementById('btn-auto').textContent = '▶ Auto'; document.getElementById('btn-auto').className = 'h-btn h-btn-secondary'; }
+  document.getElementById('round-badge').textContent = 'Round 0 / 50';
+  document.getElementById('comp-badge').textContent = 'R = 0.000';
+  document.getElementById('comp-badge').style.color = 'var(--cyan)';
+  initSim();
+}
+
+// ── Init on Load ─────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  initSim();
+  window.addEventListener('resize', () => setTimeout(resizeCharts, 100));
+});

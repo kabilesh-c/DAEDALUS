@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DAEDALUS — Mechanism Design via Adversarial RL</title>
+  <meta name="description" content="DAEDALUS: An OpenEnv RL environment that trains LLMs to design market mechanisms against adversarial agents.">
+  <link rel="stylesheet" href="styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚖️</text></svg>">
+</head>
+<body>
+<div class="app">
+
+  <!-- ═══════════ HEADER ═══════════ -->
+  <header class="header">
+    <div class="logo">DAEDALUS</div>
+    <div class="header-sep"></div>
+    <div class="tabs">
+      <button class="tab-btn active" onclick="switchTab('sim')">🎮 Simulation</button>
+      <button class="tab-btn" onclick="switchTab('arch')">📐 Architecture</button>
+      <button class="tab-btn" onclick="switchTab('train')">🧠 Training</button>
+    </div>
+    <div class="header-spacer"></div>
+    <div class="header-actions" id="sim-controls">
+      <button class="h-btn h-btn-primary" onclick="stepSim()">Step</button>
+      <button class="h-btn h-btn-secondary" id="btn-auto" onclick="toggleAuto()">▶ Auto</button>
+      <button class="h-btn h-btn-secondary" onclick="resetSim()">↻ Reset</button>
+      <div class="header-sep"></div>
+      <span class="round-info" id="round-badge">Round 0 / 50</span>
+      <span class="composite-info" id="comp-badge" style="color:var(--cyan)">R = 0.000</span>
+    </div>
+  </header>
+
+  <!-- ═══════════ SIMULATION TAB ═══════════ -->
+  <div class="tab-panel active" id="panel-sim">
+    <div class="sim-dashboard">
+
+      <!-- Controls Sidebar -->
+      <div class="controls">
+        <div class="ctrl-group">
+          <div class="ctrl-title" style="color:var(--cyan)">🧠 Neural Designer</div>
+          <button class="h-btn h-btn-secondary" id="btn-ai-mode" style="width:100%; justify-content:center;" onclick="toggleAIMode()">
+            <span id="ai-status-dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--t4); margin-right:8px;"></span>
+            Enable AI Mode
+          </button>
+          <div style="font-size:0.7rem; color:var(--t4); margin-top:6px; opacity:0.8;">Using kabilesh-c/daedalus-designer</div>
+        </div>
+
+        <div class="ctrl-sep"></div>
+
+        <div class="ctrl-group">
+          <div class="ctrl-title">🏷 Auction Type</div>
+          <select class="ctrl-select" id="ctrl-auction" onchange="onCtrlChange()">
+            <option value="first_price">First-Price Sealed</option>
+            <option value="second_price" selected>Second-Price (Vickrey)</option>
+            <option value="vcg">VCG (Dominant Strategy)</option>
+          </select>
+        </div>
+
+        <div class="ctrl-sep"></div>
+
+        <div class="ctrl-group">
+          <div class="ctrl-title">🔍 Information Policy</div>
+          <div class="toggle-row">
+            <button class="toggle-chip" id="t-reserve" onclick="togChip(this)">Reserve</button>
+            <button class="toggle-chip active" id="t-clearing" onclick="togChip(this)">Clearing</button>
+            <button class="toggle-chip" id="t-winner" onclick="togChip(this)">Winner ID</button>
+            <button class="toggle-chip" id="t-bids" onclick="togChip(this)">Bids</button>
+            <button class="toggle-chip" id="t-dist" onclick="togChip(this)">Distribution</button>
+          </div>
+        </div>
+
+        <div class="ctrl-sep"></div>
+
+        <div class="ctrl-group">
+          <div class="ctrl-title">💰 Reserve Price</div>
+          <div class="slider-row">
+            <div class="slider-head">
+              <span class="slider-lbl">Min bid</span>
+              <span class="slider-val" id="sv-reserve">0.10</span>
+            </div>
+            <input type="range" id="ctrl-reserve" min="0" max="0.9" step="0.01" value="0.10" oninput="document.getElementById('sv-reserve').textContent=parseFloat(this.value).toFixed(2)">
+          </div>
+        </div>
+
+        <div class="ctrl-sep"></div>
+
+        <div class="ctrl-group">
+          <div class="ctrl-title">⚠️ Penalties</div>
+          <div class="slider-row">
+            <div class="slider-head"><span class="slider-lbl">Shill</span><span class="slider-val" id="sv-shill">0.0</span></div>
+            <input type="range" id="ctrl-shill" min="0" max="3" step="0.1" value="0" oninput="document.getElementById('sv-shill').textContent=parseFloat(this.value).toFixed(1)">
+          </div>
+          <div class="slider-row">
+            <div class="slider-head"><span class="slider-lbl">Withdrawal</span><span class="slider-val" id="sv-withdraw">0.0</span></div>
+            <input type="range" id="ctrl-withdraw" min="0" max="3" step="0.1" value="0" oninput="document.getElementById('sv-withdraw').textContent=parseFloat(this.value).toFixed(1)">
+          </div>
+          <div class="slider-row">
+            <div class="slider-head"><span class="slider-lbl">Collusion</span><span class="slider-val" id="sv-collusion">0.0</span></div>
+            <input type="range" id="ctrl-collusion" min="0" max="3" step="0.1" value="0" oninput="document.getElementById('sv-collusion').textContent=parseFloat(this.value).toFixed(1)">
+          </div>
+        </div>
+
+        <div class="ctrl-sep"></div>
+
+        <div class="ctrl-group">
+          <div class="ctrl-title">👥 Coalition Policy</div>
+          <select class="ctrl-select" id="ctrl-coalition" onchange="onCtrlChange()">
+            <option value="allow" selected>Allow</option>
+            <option value="restrict">Restrict</option>
+            <option value="penalize_suspected">Penalize Suspected</option>
+            <option value="penalize_confirmed">Penalize Confirmed</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Auction Arena -->
+      <div class="arena">
+        <div class="arena-header">
+          <span class="arena-title">🏛 Live Auction Arena</span>
+        </div>
+        <div class="arena-grid" id="arena-grid">
+          <!-- Rendered by JS -->
+        </div>
+      </div>
+
+      <!-- Metrics Panel -->
+      <div class="metrics">
+        <div class="metrics-top">
+          <div class="metrics-title">📊 Performance</div>
+          <div class="m-grid">
+            <div class="m-box">
+              <div class="m-val c-emerald" id="mv-w">0.00</div>
+              <div class="m-lbl">Welfare W</div>
+              <div class="m-bar"><div class="m-bar-fill" id="mb-w" style="width:0%;background:var(--emerald)"></div></div>
+            </div>
+            <div class="m-box">
+              <div class="m-val c-purple" id="mv-f">0.00</div>
+              <div class="m-lbl">Fairness F</div>
+              <div class="m-bar"><div class="m-bar-fill" id="mb-f" style="width:0%;background:var(--purple)"></div></div>
+            </div>
+            <div class="m-box">
+              <div class="m-val c-amber" id="mv-p">0.00</div>
+              <div class="m-lbl">Participation P</div>
+              <div class="m-bar"><div class="m-bar-fill" id="mb-p" style="width:0%;background:var(--amber)"></div></div>
+            </div>
+            <div class="m-box">
+              <div class="m-val c-blue" id="mv-s">0.00</div>
+              <div class="m-lbl">Stability S</div>
+              <div class="m-bar"><div class="m-bar-fill" id="mb-s" style="width:0%;background:var(--blue)"></div></div>
+            </div>
+          </div>
+          <div class="composite-box">
+            <div class="comp-label">Composite Reward</div>
+            <div class="comp-value" id="comp-val">0.000</div>
+          </div>
+        </div>
+        <div class="charts-panel">
+          <div class="chart-box"><div class="chart-head">📈 Welfare</div><canvas id="ch-w"></canvas></div>
+          <div class="chart-box"><div class="chart-head">📈 Fairness</div><canvas id="ch-f"></canvas></div>
+          <div class="chart-box"><div class="chart-head">📈 Participation</div><canvas id="ch-p"></canvas></div>
+        </div>
+      </div>
+
+      <!-- Timeline -->
+      <div class="timeline-bar">
+        <div class="timeline-head">
+          <span class="timeline-title">📜 Mechanism Evolution Log</span>
+        </div>
+        <div class="timeline-scroll" id="timeline"></div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ═══════════ ARCHITECTURE TAB ═══════════ -->
+  <div class="tab-panel" id="panel-arch">
+    <div class="doc-scroll">
+      <h2>DAEDALUS System Architecture</h2>
+      <p>Mechanism Design via Adversarial RL — The first environment that trains an LLM to be a <strong>referee</strong>, designing rules that constrain self-interested agents toward socially optimal outcomes.</p>
+
+      <h3>The Core Inversion</h3>
+      <p>Every RL agent ever trained — from AlphaGo to trading bots — is a <strong>player</strong>. DAEDALUS trains the <strong>referee</strong> — the entity that sets rules so self-interested agents produce good outcomes despite themselves.</p>
+      <div class="inv-row">
+        <div class="inv-card old">
+          <div style="font-size:1.8rem">🎮</div>
+          <h4>Traditional RL</h4>
+          <p><strong style="color:var(--rose)">Train the Player</strong><br>Optimize within fixed rules</p>
+        </div>
+        <div class="inv-arrow">→</div>
+        <div class="inv-card new">
+          <div style="font-size:1.8rem">⚖️</div>
+          <h4>DAEDALUS</h4>
+          <p><strong style="color:var(--cyan)">Train the Referee</strong><br>Design rules that produce desired equilibria</p>
+        </div>
+      </div>
+
+      <h3>Three-Layer Environment</h3>
+      <p>The designer operates under <strong>partial observability</strong> — seeing only aggregate market outcomes, never individual utility functions.</p>
+      <div class="layer-box l1">
+        <div class="layer-tag c-cyan">● Outer — Mechanism Designer (LLM Agent)</div>
+        <div class="layer-desc">Observes aggregate outcomes. Sets auction type, information policy, reserve prices, penalties. Trained via GRPO.</div>
+        <div class="layer-box l2">
+          <div class="layer-tag c-emerald">● Middle — Market Simulation</div>
+          <div class="layer-desc">Runs auction mechanics: collects bids, applies allocation/payment rules, computes statistics.</div>
+          <div class="layer-box l3">
+            <div class="layer-tag c-amber">● Inner — Strategic Sub-Agents (Hidden)</div>
+            <div class="layer-desc">5 agent types with private valuations and adaptation. <strong>Never directly observable by designer.</strong></div>
+          </div>
+        </div>
+      </div>
+
+      <h3>Adversarial Agent Taxonomy</h3>
+      <div class="agent-chips">
+        <div class="a-chip" style="border-left:3px solid var(--emerald)">
+          <h5>🎯 Truthful Bidder</h5>
+          <p>Bids true valuation. Baseline welfare measurement. Naive participants.</p>
+        </div>
+        <div class="a-chip" style="border-left:3px solid var(--amber)">
+          <h5>📉 Bid Shader</h5>
+          <p>Shades bid below valuation. Adapts based on clearing prices. BNE: v×(n-1)/n.</p>
+        </div>
+        <div class="a-chip" style="border-left:3px solid var(--rose)">
+          <h5>🤝 Colluder</h5>
+          <p>Coordinates with partner. Rotates wins. Exploits transparency for cartel enforcement.</p>
+        </div>
+        <div class="a-chip" style="border-left:3px solid var(--purple)">
+          <h5>🚪 Strategic Dropout</h5>
+          <p>Exits if surplus < outside option. Forces individual rationality constraints.</p>
+        </div>
+        <div class="a-chip" style="border-left:3px solid var(--blue)">
+          <h5>💣 Budget Exploiter</h5>
+          <p>Fixed budget. Tests payment rule edge cases. Drains market liquidity.</p>
+        </div>
+      </div>
+
+      <h3>Multiplicative Reward Function</h3>
+      <p>All objectives must be jointly positive — you cannot sacrifice one to maximize another.</p>
+      <div class="reward-eq">
+        <span class="c-cyan">R(t)</span> = <span class="c-emerald">W(t)</span> × <span class="c-purple">F(t)</span> × <span class="c-amber">P(t)</span> × <span class="c-blue">S(t)</span>
+      </div>
+      <div class="term-grid">
+        <div class="term-card"><div class="tc-sym c-emerald">W</div><div class="tc-name">Welfare</div><div class="tc-desc">Allocated utility / theoretical max</div></div>
+        <div class="term-card"><div class="tc-sym c-purple">F</div><div class="tc-name">Fairness</div><div class="tc-desc">1 − Gini coefficient of payments</div></div>
+        <div class="term-card"><div class="tc-sym c-amber">P</div><div class="tc-name">Participation</div><div class="tc-desc">Active bidders / total agents</div></div>
+        <div class="term-card"><div class="tc-sym c-blue">S</div><div class="tc-name">Stability</div><div class="tc-desc">1 − σ(welfare) over last 5 rounds</div></div>
+        <div class="term-card"><div class="tc-sym c-rose">E</div><div class="tc-name">Exploration</div><div class="tc-desc">Bonus for novel configs (training only)</div></div>
+      </div>
+
+      <h3>Exploitation Dynamics</h3>
+      <p>Five simultaneous attack vectors the designer must defend against:</p>
+      <p><strong class="c-amber">1. Bid Shading</strong> — In first-price auctions, BNE bid = v×(n-1)/n. Defense: Switch to second-price or calibrate reserves.</p>
+      <p><strong class="c-rose">2. Collusion</strong> — Cartel suppresses competition by rotating wins. Revenue loss ∝ k/n. Defense: Hide winner identity, randomize reserves.</p>
+      <p><strong class="c-purple">3. Strategic Dropout</strong> — Raising reserves triggers exit cascade. Defense: Calibrate near outside option value.</p>
+      <p><strong class="c-blue">4. False Stability</strong> — Mechanism appears stable while coalition forms. Defense: 20-round temporal window, trend features.</p>
+      <p><strong class="c-emerald">5. Transparency Paradox</strong> — Revealing info reduces shading but enables collusion. Defense: Targeted opacity (reveal prices, hide winners).</p>
+
+      <h3>State & Action Spaces</h3>
+      <p><strong>Observable State:</strong> mechanism config (18 floats), market outcomes (7 metrics × 20 rounds), population proxies (9 stats), curriculum stage.</p>
+      <p><strong>Action Space:</strong> Structured JSON — auction type (discrete), info flags (5 binary), reserve price (continuous [-0.2, +0.2]), penalties (3 continuous [0,3]), coalition policy (discrete).</p>
+      <p><strong>Hidden State:</strong> Private valuations, utility parameters, coalition membership, agent type, strategy parameters — <em>never revealed</em>.</p>
+
+      <h3>OpenEnv Compliance</h3>
+      <pre>
+# OpenEnv API
+env = DaedalusEnvironment()
+obs = env.reset()        # New market scenario
+obs, reward, done, info = env.step(mechanism_config_json)
+state = env.state()      # Current observable state
+
+# Themes: #1 Multi-Agent Interactions + #4 Self-Improvement (curriculum)
+# Verifiable rewards: multiplicative composite from simulation
+# Adversarial co-evolution: sub-agents adapt within episodes
+      </pre>
+    </div>
+  </div>
+
+  <!-- ═══════════ TRAINING TAB ═══════════ -->
+  <div class="tab-panel" id="panel-train">
+    <div class="doc-scroll">
+      <h2>Training Pipeline & Setup</h2>
+      <p>Complete training setup using <strong>OpenEnv + TRL GRPO + Unsloth</strong>. Designed for Colab with free T4 GPU.</p>
+
+      <h3>Model Architecture</h3>
+      <div class="arch-flow">
+        <div class="arch-node" style="border-color:rgba(0,212,255,0.15)">
+          <h5>🧠 LLM Backbone</h5>
+          <p>Qwen2.5-7B / Llama-3.1-8B<br>Frozen + LoRA rank 16<br>4-bit quantized via Unsloth</p>
+        </div>
+        <div class="arch-arr">→</div>
+        <div class="arch-node" style="border-color:rgba(124,58,237,0.15)">
+          <h5>💭 Chain-of-Thought</h5>
+          <p>Economic reasoning trace<br>Welfare/fairness analysis<br>Exploitation detection</p>
+        </div>
+        <div class="arch-arr">→</div>
+        <div class="arch-node" style="border-color:rgba(16,185,129,0.15)">
+          <h5>📋 Structured JSON</h5>
+          <p>Valid mechanism config<br>Schema-constrained output<br>GRPO optimization</p>
+        </div>
+      </div>
+
+      <h3>Curriculum Learning (5 Stages)</h3>
+      <div class="stage-row">
+        <div class="stage-box" style="border-color:rgba(16,185,129,0.2)">
+          <div class="sb-num c-emerald">STAGE 0</div>
+          <h5>Pure Truthful Market</h5>
+          <p>All agents bid truthfully. Learn baseline tradeoffs. R > 0.75 for 50 episodes.</p>
+        </div>
+        <div class="stage-box" style="border-color:rgba(245,158,11,0.2)">
+          <div class="sb-num c-amber">STAGE 1</div>
+          <h5>+ Bid Shaders (30%)</h5>
+          <p>Multi-item auctions. Info policy becomes critical. R > 0.65 for 100 episodes.</p>
+        </div>
+        <div class="stage-box" style="border-color:rgba(124,58,237,0.2)">
+          <div class="sb-num c-purple">STAGE 2</div>
+          <h5>+ Dropout (20%)</h5>
+          <p>Reserve price tension — raising reserves triggers exit. R > 0.60 for 100 episodes.</p>
+        </div>
+        <div class="stage-box" style="border-color:rgba(244,63,94,0.2)">
+          <div class="sb-num c-rose">STAGE 3</div>
+          <h5>+ Colluders (20%)</h5>
+          <p>Transparency enables cartel enforcement. R > 0.55 for 150 episodes.</p>
+        </div>
+        <div class="stage-box" style="border-color:rgba(0,212,255,0.2)">
+          <div class="sb-num c-cyan">STAGE 4</div>
+          <h5>Full Adversarial</h5>
+          <p>All types, Dirichlet-sampled proportions. Budget exploiters added. Eval benchmark.</p>
+        </div>
+      </div>
+
+      <h3>Colab Training Setup</h3>
+      <pre>
+# ═══ Step 1: Install Dependencies ═══
+!pip install -q openenv trl unsloth transformers datasets accelerate
+!pip install -q torch --index-url https://download.pytorch.org/whl/cu121
+
+# ═══ Step 2: Load Model with Unsloth ═══
+from unsloth import FastLanguageModel
+model, tokenizer = FastLanguageModel.from_pretrained(
+    "unsloth/Qwen2.5-7B-Instruct",
+    max_seq_length=4096,
+    load_in_4bit=True,
+    dtype=None,
+)
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=16, lora_alpha=16,
+    target_modules=["q_proj","k_proj","v_proj","o_proj",
+                     "gate_proj","up_proj","down_proj"],
+    lora_dropout=0,
+    bias="none",
+    use_gradient_checkpointing="unsloth",
+)
+
+# ═══ Step 3: Define Reward Functions ═══
+def welfare_reward(output, env_state):
+    """Allocative efficiency: actual/theoretical max welfare"""
+    return env_state['welfare_ratio']
+
+def fairness_reward(output, env_state):
+    """1 - Gini coefficient of payment distribution"""
+    return 1.0 - env_state['gini_coefficient']
+
+def participation_reward(output, env_state):
+    """Fraction of agents actively bidding"""
+    return env_state['participation_rate']
+
+def stability_reward(output, env_state):
+    """Consistency of welfare over recent rounds"""
+    return env_state.get('stability_score', 0.8)
+
+def composite_reward(output, env_state):
+    """Multiplicative composite — all must be positive"""
+    w = welfare_reward(output, env_state)
+    f = fairness_reward(output, env_state)
+    p = participation_reward(output, env_state)
+    s = stability_reward(output, env_state)
+    return w * f * p * s
+
+# ═══ Step 4: Environment Rollout ═══
+from daedalus.env import DaedalusEnvironment
+
+def rollout_fn(prompts, model, tokenizer):
+    env = DaedalusEnvironment()
+    rewards = []
+    for prompt in prompts:
+        obs = env.reset()
+        # Format observation as prompt
+        state_desc = format_state(obs)
+        # Generate mechanism config
+        output = generate(model, tokenizer, state_desc)
+        # Step environment
+        obs, reward, done, info = env.step(parse_json(output))
+        rewards.append(reward)
+    return rewards
+
+# ═══ Step 5: GRPO Training ═══
+from trl import GRPOConfig, GRPOTrainer
+
+config = GRPOConfig(
+    output_dir="./daedalus-checkpoints",
+    num_train_epochs=3,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,
+    num_generations=8,        # G=8 samples per state
+    max_completion_length=512,
+    learning_rate=5e-6,
+    logging_steps=10,
+    save_steps=500,
+    bf16=True,
+)
+
+trainer = GRPOTrainer(
+    model=model,
+    config=config,
+    tokenizer=tokenizer,
+    reward_funcs=[
+        welfare_reward,
+        fairness_reward,
+        participation_reward,
+        stability_reward,
+        composite_reward,
+    ],
+    train_dataset=dataset,
+)
+
+trainer.train()
+
+# ═══ Step 6: Save & Export ═══
+model.save_pretrained_merged(
+    "daedalus-trained",
+    tokenizer,
+    save_method="merged_16bit"
+)
+      </pre>
+
+      <h3>GRPO Configuration</h3>
+      <p><strong>Why GRPO over PPO:</strong> No separate value head needed. For each state, sample G=8 mechanism configurations, evaluate each with market simulator, compute relative advantages within group. More stable for LLM policies.</p>
+      <p><strong>Key Parameters:</strong> G=8 samples per state, gamma=0.99 discount, LoRA rank 16, learning rate 5e-6, 128 parallel rollouts per batch.</p>
+      <p><strong>Reward anti-hacking:</strong> Sub-agent simulation runs 10 rounds per step; reward computed on rounds 6-10 (post-adaptation). Multiplicative structure prevents single-objective gaming.</p>
+
+      <h3>OpenEnv Manifest</h3>
+      <pre>
+# openenv.yaml
+name: daedalus
+version: 1.0.0
+description: Mechanism design training environment
+agent:
+  type: llm_with_structured_head
+  observation_space:
+    type: dict
+    fields:
+      mechanism_config: float[18]
+      market_outcomes: float[7]
+      outcome_history: float[20, 7]
+      population_proxies: float[9]
+environment:
+  n_agents: [8, 12]
+  episode_length: 50
+  rounds_per_step: 5
+  partial_observability: true
+evaluation:
+  primary_metric: composite_reward
+  held_out_populations: 20
+      </pre>
+
+      <h3>Deployment to HuggingFace Spaces</h3>
+      <pre>
+# Deploy environment server
+pip install openenv
+openenv init daedalus       # Create scaffold
+openenv push --space your-username/daedalus
+
+# Or run locally
+uvicorn server:app --host 0.0.0.0 --port 8000
+
+# Docker
+docker build -t daedalus .
+docker run -p 8000:8000 daedalus
+      </pre>
+
+      <h3>Product Paths</h3>
+      <div class="agent-chips">
+        <div class="a-chip" style="border-left:3px solid var(--cyan)">
+          <h5>🏛️ Auction Design Advisory</h5>
+          <p>Propose optimal mechanism configs and simulate against synthetic populations before deployment.</p>
+        </div>
+        <div class="a-chip" style="border-left:3px solid var(--emerald)">
+          <h5>📈 Marketplace Optimization</h5>
+          <p>Monitor live market health and suggest adjustments in response to exploitation patterns.</p>
+        </div>
+        <div class="a-chip" style="border-left:3px solid var(--amber)">
+          <h5>🔗 Tokenomics Simulator</h5>
+          <p>Simulate token incentive mechanisms against MEV bots, whale coordination before deployment.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+<script src="app.js"></script>
+</body>
+</html>

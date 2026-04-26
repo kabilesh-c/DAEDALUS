@@ -1,0 +1,74 @@
+# DAEDALUS OpenEnv Manifest
+# This file mirrors the real env definition in `daedalus/openenv_env.py`.
+name: daedalus
+version: 2.0.0
+description: >
+  Mechanism design training environment. An LLM designer agent picks
+  auction rules; adaptive sub-agents (truthful, shaders, colluders,
+  dropouts, exploiters) probe for exploits. Reward is the product of
+  welfare, fairness, participation, and stability so single-objective
+  gaming cannot succeed.
+
+themes:
+  - multi-agent-interactions   # primary
+  - self-improvement           # secondary, via 5-stage curriculum
+
+# OpenEnv compliance
+openenv:
+  framework_version: ">=0.2.3"
+  environment_class: "daedalus.openenv_env:DaedalusOpenEnv"
+  action_class: "daedalus.openenv_models:DaedalusAction"
+  observation_class: "daedalus.openenv_models:DaedalusObservation"
+  state_class: "daedalus.openenv_models:DaedalusState"
+  app: "openenv_app:app"
+  port: 7860
+  hosting:
+    space: "kabilesh-c/daedalus-env"
+    sdk: docker
+    hardware: cpu-basic
+  client_install: "pip install git+https://huggingface.co/spaces/kabilesh-c/daedalus-env"
+
+agent:
+  type: llm_with_structured_head
+  observation_space:
+    type: dict
+    fields:
+      mechanism_config: dict
+      market_outcomes: "List[dict] (last 20)"
+      population_proxies: dict
+      round_number: int
+      episode_length: int
+      curriculum_stage: int
+  action_space:
+    type: structured_json
+    schema: DaedalusAction
+
+environment:
+  n_agents: [8, 12]
+  n_items: [1, 5]
+  episode_length: 50
+  rounds_per_step: 5
+  partial_observability: true
+  sub_agent_adaptation: true
+  curriculum_stages: 5
+
+evaluation:
+  primary_metric: composite_reward
+  secondary_metrics:
+    - welfare_ratio
+    - fairness_score
+    - participation_rate
+    - collusion_resistance
+    - stability_score
+  held_out_populations: 20
+
+training:
+  method: GRPO (with SFT warmup + merge_and_unload)
+  framework: TRL
+  efficiency: PEFT-LoRA
+  model: Qwen/Qwen2.5-0.5B-Instruct
+  hub_destination: "kabilesh-c/daedalus-designer"
+  training_space: "kabilesh-c/daedalus-training-space"
+  lora_rank: 16
+  batch_size: 4
+  generations_per_state: 4
