@@ -43,6 +43,11 @@ import sys
 import traceback
 from typing import Any, Dict, List
 
+from dotenv import load_dotenv
+
+# Load environment variables from .env
+load_dotenv()
+
 
 # -------------------------------------------------------------------
 # Auth

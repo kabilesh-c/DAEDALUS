@@ -26,7 +26,11 @@ import shutil
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
 from huggingface_hub import HfApi
+
+# Load environment variables from .env
+load_dotenv()
 
 
 REPO_ID = os.environ.get("DAEDALUS_ENV_SPACE", "kabilesh-c/daedalus-env")

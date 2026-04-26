@@ -13,6 +13,8 @@ transformers>=4.45.0
 peft>=0.13.0
 accelerate>=0.30.0
 huggingface_hub>=0.24.0
+python-dotenv>=1.0.0
+
 
 # --- Training only (uncomment when retraining) ---
 # trl>=0.12.0
