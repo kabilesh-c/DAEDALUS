@@ -35,7 +35,7 @@ if not HF_TOKEN:
 
 TRAINING_SPACE = os.environ.get("DAEDALUS_TRAINING_SPACE", "Laksh718/daedalus-training-space")
 HUB_MODEL_ID   = os.environ.get("DAEDALUS_HUB_MODEL_ID",   "Laksh718/daedalus-designer")
-FLAVOR         = os.environ.get("DAEDALUS_JOB_FLAVOR",      "l4x4")
+FLAVOR         = os.environ.get("DAEDALUS_JOB_FLAVOR",      "l4x1")
 TRAIN_MODE     = os.environ.get("DAEDALUS_TRAIN_MODE",       "full")
 TIMEOUT        = os.environ.get("DAEDALUS_JOB_TIMEOUT",      "3h")
 
