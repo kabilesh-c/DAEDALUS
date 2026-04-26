@@ -179,45 +179,46 @@ async def step(req: StepRequest) -> StepResponse:
 
 @app.post("/api/design")
 async def design_mechanism(observation: dict):
-    """Ask the trained AI Designer (kabilesh-c/daedalus-designer LoRA) for a mechanism."""
-    model, tokenizer = load_designer()
+    """Ask the trained AI Designer for a mechanism. Falls back to default if training is incomplete."""
+    try:
+        model, tokenizer = load_designer()
 
-    user_prompt = _build_prompt(observation)
-    chat = [{"role": "user", "content": user_prompt}]
-    prompt_text = tokenizer.apply_chat_template(
-        chat, tokenize=False, add_generation_prompt=True
-    )
-
-    inputs = tokenizer(prompt_text, return_tensors="pt")
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
-    with torch.no_grad():
-        out = model.generate(
-            **inputs,
-            max_new_tokens=200,
-            do_sample=True,
-            temperature=0.7,
-            top_p=0.9,
-            pad_token_id=tokenizer.eos_token_id,
+        user_prompt = _build_prompt(observation)
+        chat = [{"role": "user", "content": user_prompt}]
+        prompt_text = tokenizer.apply_chat_template(
+            chat, tokenize=False, add_generation_prompt=True
         )
 
-    completion = tokenizer.decode(
-        out[0, inputs["input_ids"].shape[-1]:], skip_special_tokens=True
-    )
+        inputs = tokenizer(prompt_text, return_tensors="pt")
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-    print(f"[designer] raw completion: {completion[:240]!r}")
+        with torch.no_grad():
+            out = model.generate(
+                **inputs,
+                max_new_tokens=200,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+                pad_token_id=tokenizer.eos_token_id,
+            )
 
-    j_start = completion.find("{")
-    j_end = completion.rfind("}") + 1
-    if j_start >= 0 and j_end > j_start:
-        try:
-            mech = json.loads(completion[j_start:j_end])
-            print(f"[designer] parsed mechanism: {mech}")
-            return mech
-        except json.JSONDecodeError as e:
-            print(f"[designer] JSON parse failed: {e}")
+        completion = tokenizer.decode(
+            out[0, inputs["input_ids"].shape[-1]:], skip_special_tokens=True
+        )
 
-    print(f"[designer] returning fallback default mechanism")
+        j_start = completion.find("{")
+        j_end = completion.rfind("}") + 1
+        if j_start >= 0 and j_end > j_start:
+            try:
+                mech = json.loads(completion[j_start:j_end])
+                return mech
+            except json.JSONDecodeError:
+                pass
+
+    except Exception as e:
+        print(f"[designer] AI generation unavailable (likely still training): {e}")
+
+    # Graceful fallback to a robust default mechanism
     return _DEFAULT_MECHANISM
 
 
