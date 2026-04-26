@@ -391,7 +391,31 @@ def run_sft(model, tokenizer):
     from trl import SFTConfig, SFTTrainer
 
     print(f"[sft] generating {N_SFT_EXAMPLES} synthetic (prompt, mechanism) pairs ...")
-    dataset = Dataset.from_list(generate_sft_examples(N_SFT_EXAMPLES))
+    raw = generate_sft_examples(N_SFT_EXAMPLES)
+
+    # Pre-render every (user, assistant) pair through the chat template into
+    # a flat `text` column. Unsloth 2026.4.x's SFTTrainer wrapper no longer
+    # accepts raw `messages` rows and demands a `formatting_func`. We provide
+    # BOTH a `text` column AND a `formatting_func` so the wrapper works
+    # regardless of which path it takes (`_prepare_dataset` checks both).
+    rendered = []
+    for ex in raw:
+        text = tokenizer.apply_chat_template(
+            ex["messages"],
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        rendered.append({"text": text})
+    dataset = Dataset.from_list(rendered)
+    print(f"[sft] dataset rendered, columns={dataset.column_names}, n={len(dataset)}")
+
+    def _sft_formatting_func(example):
+        # Handles both single-example (dict of scalars) and batch
+        # (dict of lists) modes that different TRL/Unsloth versions use.
+        text = example.get("text")
+        if isinstance(text, list):
+            return text
+        return [text] if isinstance(text, str) else []
 
     cfg = SFTConfig(
         output_dir=OUT_DIR + "-sft",
@@ -406,6 +430,7 @@ def run_sft(model, tokenizer):
         bf16=USE_BF16,
         fp16=USE_FP16,
         max_seq_length=MAX_SEQ_LEN,
+        dataset_text_field="text",
         report_to="none",
         seed=42,
     )
@@ -417,6 +442,7 @@ def run_sft(model, tokenizer):
         processing_class=tokenizer,
         train_dataset=dataset,
         args=cfg,
+        formatting_func=_sft_formatting_func,
     )
     print("[sft] training ...")
     trainer.train()
@@ -431,7 +457,7 @@ def run_grpo(model, tokenizer):
     from datasets import Dataset
     from trl import GRPOConfig, GRPOTrainer
 
-    print("[grpo v4] using single-adapter (no merge) approach")
+    print("[grpo v5] using single-adapter (no merge) approach + SFT formatting_func fix")
     print(f"[grpo] generating {N_GRPO_PROMPTS} prompts ...")
     dataset = Dataset.from_list(generate_grpo_prompts(N_GRPO_PROMPTS))
 

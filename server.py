@@ -7,7 +7,9 @@ Usage:
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import threading
 import traceback
@@ -20,7 +22,7 @@ load_dotenv()
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from peft import PeftModel
 from pydantic import BaseModel
@@ -159,9 +161,49 @@ def _kickoff_designer_load() -> None:
     t.start()
 
 
+def _quiet_protocol_noise(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """
+    Swallow harmless h11 / uvicorn protocol noise that fires when a client
+    drops the connection mid-response (common on Windows with browser
+    keep-alive probes, link previewers, dev-tools sniffers, etc.).
+
+    Real exceptions (anything that isn't a LocalProtocolError or a
+    ConnectionResetError-style abort) still go through the default handler
+    so genuine bugs are NOT masked.
+    """
+    exc = context.get("exception")
+    msg = context.get("message", "") or ""
+    if exc is not None:
+        name = exc.__class__.__name__
+        if name in {"LocalProtocolError", "ConnectionResetError",
+                    "ConnectionAbortedError", "BrokenPipeError"}:
+            return
+    if "Invalid HTTP request" in msg or "can't handle event type Response" in msg:
+        return
+    loop.default_exception_handler(context)
+
+
+class _NoInvalidHTTPFilter(logging.Filter):
+    """Drop uvicorn's WARNING level 'Invalid HTTP request received' line —
+    it's already covered by the asyncio handler above, so the duplicate
+    is just noise."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "Invalid HTTP request" not in record.getMessage()
+
+
 @app.on_event("startup")
 async def _startup_warmup() -> None:
-    """Begin downloading + loading the designer the moment the server boots."""
+    """Begin downloading + loading the designer the moment the server boots,
+    and install quiet handlers for harmless protocol-level noise."""
+    try:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(_quiet_protocol_noise)
+    except RuntimeError:
+        pass
+    for logger_name in ("uvicorn.error", "uvicorn", "uvicorn.access"):
+        logging.getLogger(logger_name).addFilter(_NoInvalidHTTPFilter())
+
     _kickoff_designer_load()
 
 
@@ -204,21 +246,6 @@ def _build_prompt(observation: dict) -> str:
         "Output strictly a single JSON object, no commentary.",
     ])
     return "\n".join(lines)
-
-
-_DEFAULT_MECHANISM = {
-    "auction_type": "second_price",
-    "reserve_price": 0.10,
-    "reveal_reserve": True,
-    "reveal_competing_bids": False,
-    "reveal_winner_identity": False,
-    "reveal_clearing_price": True,
-    "reveal_bid_distribution": False,
-    "shill_penalty": 1.0,
-    "withdrawal_penalty": 0.5,
-    "collusion_penalty": 1.5,
-    "coalition_policy": "penalize_suspected",
-}
 
 
 class ResetRequest(BaseModel):
@@ -286,37 +313,53 @@ async def designer_warmup() -> dict:
 
 
 @app.post("/api/design")
-async def design_mechanism(observation: dict) -> dict:
+async def design_mechanism(observation: dict):
     """
     Ask the trained AI Designer for a mechanism.
 
-    Always returns:
-        {
-          "mechanism": {...},
-          "source":    "ai" | "fallback",
-          "status":    "ready" | "loading" | "error",
-          "error":     <string or null>,
-        }
+    There is NO fallback. The frontend must surface failures explicitly.
+
+    Success (HTTP 200):
+        {"mechanism": {...}, "source": "ai", "status": "ready", "error": null}
+
+    Designer not ready yet (HTTP 503, status="loading"):
+        {"detail": "...", "status": "loading", "error": null}
+
+    Designer load failed (HTTP 503, status="error"):
+        {"detail": "...", "status": "error", "error": "<load traceback head>"}
+
+    Model returned unparseable output (HTTP 502):
+        {"detail": "...", "status": "ready",
+         "error": "<reason>", "raw": "<truncated completion>"}
+
+    Inference exception (HTTP 500):
+        {"detail": "...", "status": "error", "error": "<exception>"}
     """
     status = DESIGNER_STATUS["status"]
 
     if status in ("idle", "loading"):
         if status == "idle":
             _kickoff_designer_load()
-        return {
-            "mechanism": _DEFAULT_MECHANISM,
-            "source": "fallback",
-            "status": DESIGNER_STATUS["status"],
-            "error": "Designer is still loading; using safe default for this step.",
-        }
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Designer is still loading. Try again in a few seconds.",
+                "status": DESIGNER_STATUS["status"],
+                "error": None,
+                "adapter": ADAPTER_ID,
+            },
+        )
 
     if status == "error" or DESIGNER_MODEL is None or DESIGNER_TOKENIZER is None:
-        return {
-            "mechanism": _DEFAULT_MECHANISM,
-            "source": "fallback",
-            "status": "error",
-            "error": DESIGNER_STATUS["error"] or "Designer model is not available.",
-        }
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Designer model failed to load.",
+                "status": "error",
+                "error": DESIGNER_STATUS["error"] or "Designer model is not available.",
+                "adapter": ADAPTER_ID,
+            },
+        )
 
     try:
         model = DESIGNER_MODEL
@@ -347,40 +390,60 @@ async def design_mechanism(observation: dict) -> dict:
 
         j_start = completion.find("{")
         j_end = completion.rfind("}") + 1
-        if j_start >= 0 and j_end > j_start:
-            try:
-                mech = json.loads(completion[j_start:j_end])
-                if isinstance(mech, dict):
-                    return {
-                        "mechanism": mech,
-                        "source": "ai",
-                        "status": "ready",
-                        "error": None,
-                    }
-            except json.JSONDecodeError as je:
-                return {
-                    "mechanism": _DEFAULT_MECHANISM,
-                    "source": "fallback",
+
+        if j_start < 0 or j_end <= j_start:
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "detail": "Model returned no JSON object.",
                     "status": "ready",
-                    "error": f"AI returned malformed JSON: {je}",
-                }
+                    "error": "AI completion contained no JSON object.",
+                    "raw": completion[:400],
+                },
+            )
+
+        try:
+            mech = json.loads(completion[j_start:j_end])
+        except json.JSONDecodeError as je:
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "detail": "Model returned malformed JSON.",
+                    "status": "ready",
+                    "error": f"JSONDecodeError: {je}",
+                    "raw": completion[j_start:j_end][:400],
+                },
+            )
+
+        if not isinstance(mech, dict):
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "detail": "Model output parsed but is not a JSON object.",
+                    "status": "ready",
+                    "error": f"Expected dict, got {type(mech).__name__}",
+                    "raw": completion[j_start:j_end][:400],
+                },
+            )
 
         return {
-            "mechanism": _DEFAULT_MECHANISM,
-            "source": "fallback",
+            "mechanism": mech,
+            "source": "ai",
             "status": "ready",
-            "error": "AI completion contained no JSON object.",
+            "error": None,
         }
 
     except Exception as e:
         traceback.print_exc()
         print(f"[designer] inference failed: {e}")
-        return {
-            "mechanism": _DEFAULT_MECHANISM,
-            "source": "fallback",
-            "status": "error",
-            "error": f"{type(e).__name__}: {e}",
-        }
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": "Inference failed inside the designer model.",
+                "status": "error",
+                "error": f"{type(e).__name__}: {e}",
+            },
+        )
 
 
 @app.get("/state")

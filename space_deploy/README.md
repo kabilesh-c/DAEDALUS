@@ -5,7 +5,7 @@ colorFrom: indigo
 colorTo: purple
 sdk: docker
 pinned: false
-hardware: t4-medium
+hardware: t4-small
 ---
 
 # DAEDALUS Training Space (v4)
@@ -31,7 +31,7 @@ m = AutoModelForCausalLM.from_pretrained("kabilesh-c/daedalus-designer")
 t = AutoTokenizer.from_pretrained("kabilesh-c/daedalus-designer")
 ```
 
-Look for the sentinel line `[grpo v4] using single-adapter (no merge) approach`
+Look for the sentinel line `[grpo v5] using single-adapter (no merge) approach + SFT formatting_func fix`
 in container logs to confirm the new code is live.
 
 Mode is controlled by the `TRAIN_MODE` Space variable:

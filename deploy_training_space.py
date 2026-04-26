@@ -44,7 +44,12 @@ load_dotenv()
 
 
 REPO_ID = os.environ.get("DAEDALUS_TRAINING_SPACE", "kabilesh-c/daedalus-training-space")
-HARDWARE = os.environ.get("DAEDALUS_HARDWARE", "t4-medium")
+# t4-small is the SAME T4 GPU as t4-medium, just less CPU/RAM around it.
+# Qwen 0.5B + LoRA + 4-bit is tiny (~3 GB VRAM), so t4-small is more than
+# enough — and HF rarely has scheduler shortages for t4-small the way it
+# does for t4-medium. Override with DAEDALUS_HARDWARE if you need a larger
+# tier (e.g. a10g-small, a10g-large, l4x1).
+HARDWARE = os.environ.get("DAEDALUS_HARDWARE", "t4-small")
 TRAIN_MODE = os.environ.get("DAEDALUS_TRAIN_MODE", "smoke")
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -106,7 +111,7 @@ colorFrom: indigo
 colorTo: purple
 sdk: docker
 pinned: false
-hardware: t4-medium
+hardware: t4-small
 ---
 
 # DAEDALUS Training Space (v4)
@@ -132,7 +137,7 @@ m = AutoModelForCausalLM.from_pretrained("kabilesh-c/daedalus-designer")
 t = AutoTokenizer.from_pretrained("kabilesh-c/daedalus-designer")
 ```
 
-Look for the sentinel line `[grpo v4] using single-adapter (no merge) approach`
+Look for the sentinel line `[grpo v5] using single-adapter (no merge) approach + SFT formatting_func fix`
 in container logs to confirm the new code is live.
 
 Mode is controlled by the `TRAIN_MODE` Space variable:
@@ -204,7 +209,7 @@ def main() -> None:
         repo_type="space",
         path_in_repo=".",
         ignore_patterns=["__pycache__/*", "*.pyc"],
-        commit_message=f"deploy v4 ({TRAIN_MODE} mode)",
+        commit_message=f"deploy v5: SFT formatting_func fix ({TRAIN_MODE} mode)",
     )
     commit_oid = getattr(commit_info, "oid", None) or getattr(commit_info, "commit_url", None)
     p(f"        upload commit: {commit_oid}")
@@ -251,7 +256,7 @@ def main() -> None:
     p("=" * 64)
     p(
         "Watch the container logs for the line:\n"
-        "    [grpo v4] using single-adapter (no merge) approach\n"
+        "    [grpo v5] using single-adapter (no merge) approach + SFT formatting_func fix\n"
         "If you DON'T see it, the new code did not ship and you should re-run\n"
         "this script (NOT just click Restart on the Space settings page)."
     )

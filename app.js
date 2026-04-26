@@ -27,16 +27,63 @@ function switchTab(id) {
 function toggleAIMode() {
   aiMode = !aiMode;
   if (aiMode) {
-    // Kick the backend to start downloading/loading immediately if it hasn't.
+    aiLog('AI mode enabled — warming up designer...', 'info');
     fetch('/api/designer/warmup', { method: 'POST' })
       .then(r => r.json())
-      .then(s => { designerStatus = s; renderDesignerStatus(); })
-      .catch(() => {});
+      .then(s => {
+        designerStatus = s;
+        renderDesignerStatus();
+        aiLog(`Warmup ack — status=${s.status || 'idle'}`, 'info');
+      })
+      .catch(e => aiLog(`Warmup request failed: ${e}`, 'error'));
     startDesignerPolling();
   } else {
+    aiLog('AI mode disabled', 'info');
     stopDesignerPolling();
   }
   renderDesignerStatus();
+}
+
+// ── AI Log ───────────────────────────────────────────
+function aiLog(msg, severity) {
+  const el = document.getElementById('ai-log');
+  if (!el) return;
+  const empty = el.querySelector('.ai-log-empty');
+  if (empty) empty.remove();
+  const colors = {
+    error:  'var(--rose)',
+    warn:   'var(--amber)',
+    ok:     'var(--emerald)',
+    info:   'var(--t4)',
+  };
+  const col = colors[severity] || colors.info;
+  const t = new Date().toLocaleTimeString([], { hour12: false });
+  const row = document.createElement('div');
+  row.style.cssText = `color:${col}; margin-bottom:2px; word-break:break-word;`;
+  row.textContent = `[${t}] ${msg}`;
+  el.insertBefore(row, el.firstChild);
+  while (el.childNodes.length > 50) el.removeChild(el.lastChild);
+}
+
+let _lastPolledStatus = null;
+let _autoEngagedOnce = false;
+function _logStatusTransition(prev, next, error) {
+  if (prev === next) return;
+  if (next === 'ready') {
+    aiLog(`Designer ready — model loaded`, 'ok');
+    if (!aiMode && !_autoEngagedOnce) {
+      _autoEngagedOnce = true;
+      aiMode = true;
+      aiLog('AI mode auto-engaged — simulation will now use real adapter inferences', 'ok');
+      renderDesignerStatus();
+    }
+  } else if (next === 'loading') {
+    aiLog('Designer loading (downloading weights)…', 'info');
+  } else if (next === 'error') {
+    aiLog(`Designer load FAILED: ${error || 'unknown'}`, 'error');
+  } else if (next === 'idle') {
+    aiLog('Designer idle', 'info');
+  }
 }
 
 function renderDesignerStatus() {
@@ -51,8 +98,14 @@ function renderDesignerStatus() {
   let cls = '';
 
   if (!aiMode) {
-    label = 'Enable AI Mode';
-    dotColor = s === 'ready' ? 'var(--emerald)' : (s === 'loading' ? 'var(--amber)' : (s === 'error' ? 'var(--rose)' : 'var(--t4)'));
+    if (s === 'ready') {
+      label = 'Engage AI →';
+      dotColor = 'var(--emerald)';
+      glow = ' box-shadow: 0 0 10px var(--emerald); animation: ai-pulse 1.6s infinite;';
+    } else {
+      label = 'Enable AI Mode';
+      dotColor = s === 'loading' ? 'var(--amber)' : (s === 'error' ? 'var(--rose)' : 'var(--t4)');
+    }
   } else if (s === 'ready') {
     label = 'AI Active';
     dotColor = 'var(--cyan)';
@@ -100,6 +153,8 @@ async function pollDesignerStatus() {
   } catch (e) {
     designerStatus = { status: 'error', error: 'Server unreachable' };
   }
+  _logStatusTransition(_lastPolledStatus, designerStatus.status, designerStatus.error);
+  _lastPolledStatus = designerStatus.status;
   renderDesignerStatus();
   if (designerStatus.status === 'ready' || designerStatus.status === 'error') {
     stopDesignerPolling();
@@ -178,49 +233,129 @@ function refreshVals() {
   });
 }
 
+// ── AI request (returns mechanism object on success, null on failure) ─
+//
+// IMPORTANT: this function NEVER returns synthetic / default mechanism data.
+// Every failure path:
+//   1. logs a clear message to the in-page AI log,
+//   2. updates designerStatus + the AI button,
+//   3. pauses auto-mode on hard failures so the simulation does not
+//      silently run with stale or non-AI rules,
+//   4. returns null so the caller can abort the round.
+async function fetchAIMechanism() {
+  const obs = {
+    round_number: S.round,
+    market_outcomes: S.hist.w.map((w, i) => ({
+      welfare_ratio: w,
+      gini_coefficient: 1 - S.hist.f[i],
+      participation_rate: S.hist.p[i],
+      composite_reward: S.hist.c[i],
+    })),
+  };
+
+  let res;
+  try {
+    res = await fetch('/api/design', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(obs),
+    });
+  } catch (e) {
+    designerStatus = { status: 'error', error: 'Server unreachable: ' + e };
+    renderDesignerStatus();
+    aiLog(`Network error contacting /api/design: ${e}`, 'error');
+    pauseAuto('AI server unreachable');
+    return null;
+  }
+
+  let payload = null;
+  try {
+    payload = await res.json();
+  } catch (e) {
+    aiLog(`HTTP ${res.status}: response was not valid JSON`, 'error');
+    pauseAuto('Bad response from /api/design');
+    return null;
+  }
+
+  if (!res.ok) {
+    designerStatus = {
+      status: payload.status || 'error',
+      error: payload.error || payload.detail || `HTTP ${res.status}`,
+      adapter: payload.adapter,
+    };
+    renderDesignerStatus();
+
+    if (res.status === 503 && payload.status === 'loading') {
+      aiLog(`HTTP 503: ${payload.detail || 'designer loading'} — round skipped, will retry`, 'warn');
+      startDesignerPolling();
+      // soft error: keep auto running so it retries when ready
+      return null;
+    }
+
+    const reason = payload.error || payload.detail || `HTTP ${res.status}`;
+    if (payload.raw) {
+      aiLog(`HTTP ${res.status}: ${payload.detail || 'bad model output'}`, 'error');
+      aiLog(`  raw → ${String(payload.raw).slice(0, 200)}`, 'error');
+    } else {
+      aiLog(`HTTP ${res.status}: ${reason}`, 'error');
+    }
+    pauseAuto(`AI error (HTTP ${res.status})`);
+    return null;
+  }
+
+  const mech = payload && payload.mechanism;
+  if (!mech || typeof mech !== 'object') {
+    aiLog(`Server returned 200 but body had no mechanism object`, 'error');
+    pauseAuto('Empty AI response');
+    return null;
+  }
+
+  designerStatus = {
+    status: payload.status || 'ready',
+    error: payload.error || null,
+    adapter: designerStatus.adapter,
+  };
+  renderDesignerStatus();
+  return mech;
+}
+
+function pauseAuto(reason) {
+  if (!autoId) return;
+  clearInterval(autoId);
+  autoId = null;
+  const btn = document.getElementById('btn-auto');
+  if (btn) {
+    btn.textContent = '▶ Auto';
+    btn.className = 'h-btn h-btn-secondary';
+  }
+  aiLog(`Auto-step paused — ${reason}`, 'warn');
+}
+
 // ── Step ─────────────────────────────────────────────
 async function stepSim() {
   if (!S || S.round >= MAX_ROUNDS) return;
-  
+
   let m;
   let mechSource = 'manual';
+
   if (aiMode) {
-    const obs = {
-        round_number: S.round,
-        market_outcomes: S.hist.w.map((w, i) => ({
-            welfare_ratio: w,
-            gini_coefficient: 1 - S.hist.f[i],
-            participation_rate: S.hist.p[i],
-            composite_reward: S.hist.c[i]
-        }))
-    };
-    try {
-        const res = await fetch('/api/design', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(obs)
-        });
-        const payload = await res.json();
-        // New response shape: {mechanism, source, status, error}
-        // Old shape (raw mechanism object) is also tolerated.
-        const aiMech = payload && payload.mechanism ? payload.mechanism : payload;
-        mechSource = (payload && payload.source) || 'ai';
-        if (payload && payload.status) {
-          designerStatus = { status: payload.status, error: payload.error };
-          renderDesignerStatus();
-          if (payload.status === 'loading') startDesignerPolling();
-        }
-        m = { ...readMech(), ...mapAiMechToUiKeys(aiMech) };
-        applyMechToUI(aiMech);
-    } catch (e) {
-        console.error("AI Mode request failed:", e);
-        designerStatus = { status: 'error', error: String(e) };
-        renderDesignerStatus();
-        m = readMech();
-        mechSource = 'fallback';
+    const aiMech = await fetchAIMechanism();
+    if (aiMech === null) {
+      // AI unavailable. NO FALLBACK — abort the round entirely.
+      // Errors are already pushed to the AI log by fetchAIMechanism().
+      return;
     }
+    m = { ...readMech(), ...mapAiMechToUiKeys(aiMech) };
+    applyMechToUI(aiMech);
+    mechSource = 'ai';
+    aiLog(`Round ${S.round + 1}: AI mechanism received (${aiMech.auction_type || '?'}, reserve=${(aiMech.reserve_price ?? 0).toFixed(2)})`, 'ok');
   } else {
     m = readMech();
+    // Loud notice: model is ready but the toggle is off, so we are running
+    // on slider values, NOT on adapter inferences.
+    if (designerStatus.status === 'ready') {
+      aiLog(`Round ${S.round + 1}: AI mode is OFF — using slider values (click "Enable AI Mode" to call the adapter)`, 'warn');
+    }
   }
   S.lastSource = mechSource;
 
@@ -329,7 +464,7 @@ async function stepSim() {
   updateMetrics();
   updateCharts();
   updateTimeline(m);
-  const srcTag = S.lastSource === 'ai' ? '  [AI]' : (S.lastSource === 'fallback' ? '  [fallback]' : '');
+  const srcTag = S.lastSource === 'ai' ? '  [AI]' : '';
   document.getElementById('round-badge').textContent = `Round ${S.round} / ${MAX_ROUNDS}${srcTag}`;
   document.getElementById('comp-badge').textContent = `R = ${met.c.toFixed(3)}`;
   document.getElementById('comp-badge').style.color = met.c > 0.3 ? 'var(--emerald)' : met.c > 0.1 ? 'var(--amber)' : 'var(--rose)';
@@ -581,15 +716,54 @@ function toggleAuto() {
 }
 
 function resetSim() {
-  if (autoId) { clearInterval(autoId); autoId = null; document.getElementById('btn-auto').textContent = '▶ Auto'; document.getElementById('btn-auto').className = 'h-btn h-btn-secondary'; }
+  if (autoId) {
+    clearInterval(autoId);
+    autoId = null;
+    document.getElementById('btn-auto').textContent = '▶ Auto';
+    document.getElementById('btn-auto').className = 'h-btn h-btn-secondary';
+  }
   document.getElementById('round-badge').textContent = 'Round 0 / 50';
   document.getElementById('comp-badge').textContent = 'R = 0.000';
   document.getElementById('comp-badge').style.color = 'var(--cyan)';
+
+  // Clear the AI log so stale "AI mode is OFF" / error entries from the
+  // previous run don't bleed into the next session.
+  const logEl = document.getElementById('ai-log');
+  if (logEl) {
+    logEl.innerHTML = '<div class="ai-log-empty" style="opacity:0.5;">AI log will appear here…</div>';
+  }
+
+  // Re-arm auto-engage so a freshly-reset run with a ready designer ends up
+  // calling the adapter, instead of silently inheriting an "off" toggle from
+  // the previous session.
+  _autoEngagedOnce = false;
+  if (designerStatus && designerStatus.status === 'ready' && !aiMode) {
+    aiMode = true;
+    _autoEngagedOnce = true;
+    aiLog('Reset — AI mode auto-engaged (designer is ready)', 'ok');
+    renderDesignerStatus();
+  } else if (aiMode) {
+    aiLog('Reset — AI mode still active', 'info');
+  } else {
+    aiLog('Reset — AI mode off (designer not ready yet)', 'info');
+  }
+
   initSim();
 }
 
 // ── Init on Load ─────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
+  // Inject the AI-button pulse keyframe so it lives without touching styles.css.
+  const styleEl = document.createElement('style');
+  styleEl.textContent = `
+    @keyframes ai-pulse {
+      0%   { box-shadow: 0 0 6px rgba(16,185,129,0.6); }
+      50%  { box-shadow: 0 0 14px rgba(16,185,129,1.0); }
+      100% { box-shadow: 0 0 6px rgba(16,185,129,0.6); }
+    }
+  `;
+  document.head.appendChild(styleEl);
+
   initSim();
   window.addEventListener('resize', () => setTimeout(resizeCharts, 100));
   // Show server-side designer status from the start so the user sees
