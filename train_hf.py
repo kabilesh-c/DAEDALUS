@@ -1,35 +1,11 @@
 """
-DAEDALUS Training - Qwen2.5-0.5B + SFT warmup + GRPO refinement (v3)
+DAEDALUS Training - Qwen2.5-0.5B + Unsloth + GRPO Multi-Reward (v4)
 =====================================================================
-Two-phase pipeline that produces a reliable mechanism-designer LoRA:
-
-    Phase 1 (SFT, ~2-4 min in short mode):
-        Teach the model the JSON output format on synthetic
-        (prompt, valid mechanism) pairs.
-
-    Phase 1.5 (merge):
-        Merge the SFT LoRA into the base model -> ./sft-merged
-        This avoids the AutoPeftModel.from_pretrained "frozen adapter"
-        trap that broke GRPO at step 0 in v1/v2.
-
-    Phase 2 (GRPO, ~6-12 min in short mode):
-        Reload the merged model fresh, attach a brand-new LoRA via
-        peft_config (so TRL handles requires_grad correctly by
-        construction), then refine with a format-shaped reward.
-
-    Phase 3 (push):
-        Upload the GRPO adapter and a training_history.json (loss/
-        reward curves) to the Hub for the hackathon demo plots.
-
-Auto-pauses the host HF Space on completion so we never re-enter the
-Docker restart loop.
-
-Authentication: HF_TOKEN env var (NEVER hardcoded). On HF Spaces this
-is supplied as a Space Secret.
-
-Short / long mode is controlled by env vars:
-    TRAIN_MODE=short  (default) -> tight defaults, ~10-15 min total
-    TRAIN_MODE=long              -> wider defaults, ~45-60 min total
+Enhanced pipeline for the OpenEnv Hackathon:
+    - Unsloth for 2x-4x faster RL training.
+    - Decomposed Rewards (Format, Welfare, Fairness, Participation).
+    - OpenEnv-compliant environment interaction.
+    - Stage-based Curriculum.
 """
 
 from __future__ import annotations
@@ -41,7 +17,8 @@ import random
 import shutil
 import sys
 import traceback
-from typing import Any, Dict, List
+import functools
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
@@ -66,6 +43,14 @@ else:
 
 
 # -------------------------------------------------------------------
+# Unsloth & TRL Patching
+# -------------------------------------------------------------------
+# We patch before importing TRL to ensure Unsloth speedups are applied.
+from unsloth import FastLanguageModel, PatchFastRL
+PatchFastRL("grpo", "unsloth/Qwen2.5-0.5B-Instruct")
+
+
+# -------------------------------------------------------------------
 # Make daedalus/ importable regardless of cwd
 # -------------------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -73,91 +58,53 @@ for candidate in (SCRIPT_DIR, "/workspace", "/app"):
     if os.path.isdir(os.path.join(candidate, "daedalus")) and candidate not in sys.path:
         sys.path.insert(0, candidate)
 
-# Use the OpenEnv-compliant class wherever possible. We fall back to the
-# legacy tuple-returning class only if openenv-core fails to import (e.g.
-# when running on a machine without it during local debugging).
 try:
     from daedalus import DaedalusOpenEnv, DaedalusAction  # noqa: E402
-
     USE_OPENENV = True
-    print("[env] using DaedalusOpenEnv (inherits openenv.core.Environment)")
 except Exception as _exc:  # noqa: BLE001
-    print(f"[env] WARNING: falling back to legacy DaedalusEnvironment: {_exc}")
-    from daedalus.env import DaedalusEnvironment  # noqa: E402
-
+    print(f"[env] error loading DaedalusOpenEnv: {_exc}")
     USE_OPENENV = False
 
 
 def _to_dict(obs: Any) -> dict:
-    """Normalize an observation (Pydantic OpenEnv obj OR legacy dict) to a dict."""
-    if isinstance(obs, dict):
-        return obs
-    if hasattr(obs, "model_dump"):
-        return obs.model_dump()
-    if hasattr(obs, "to_dict"):
-        return obs.to_dict()
+    if isinstance(obs, dict): return obs
+    if hasattr(obs, "model_dump"): return obs.model_dump()
+    if hasattr(obs, "to_dict"): return obs.to_dict()
     return dict(obs)
 
 
-def make_env() -> Any:
-    """Return an env where:
-      - `env.reset()` returns the canonical OpenEnv observation
-        (DaedalusObservation Pydantic model). Use `_to_dict(obs)` if
-        you need a plain dict for prompt formatting.
-      - `env._step_tuple(action)` returns the legacy
-        `(obs_dict, reward, done, info)` tuple so the training-data
-        loops can stay short.
-    """
-    if USE_OPENENV:
-        env = DaedalusOpenEnv()
-        env._step_tuple = env.step_tuple
-        return env
-    env = DaedalusEnvironment()
-    env._step_tuple = env.step
-    return env
+def make_env(stage: int = 0) -> Any:
+    return DaedalusOpenEnv(curriculum_stage=stage)
 
 
 # -------------------------------------------------------------------
-# Config (env-overridable)
+# Config
 # -------------------------------------------------------------------
 TRAIN_MODE = os.environ.get("TRAIN_MODE", "short").lower()
-
-MODEL_ID = os.environ.get("BASE_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+MODEL_ID = os.environ.get("BASE_MODEL", "unsloth/Qwen2.5-0.5B-Instruct")
 HUB_REPO = os.environ.get("HUB_MODEL_ID", "kabilesh-c/daedalus-designer")
 
 if TRAIN_MODE == "long":
-    N_SFT_EXAMPLES_DEFAULT = "300"
-    SFT_EPOCHS_DEFAULT = "2"
-    N_GRPO_PROMPTS_DEFAULT = "200"
-    GRPO_STEPS_DEFAULT = "120"
+    N_SFT_EXAMPLES = 300
+    SFT_EPOCHS = 2
+    N_GRPO_PROMPTS = 200
+    GRPO_STEPS = 120
 else:
-    # short = aggressive but still moves the reward curve
-    N_SFT_EXAMPLES_DEFAULT = "120"
-    SFT_EPOCHS_DEFAULT = "1"
-    N_GRPO_PROMPTS_DEFAULT = "80"
-    GRPO_STEPS_DEFAULT = "40"
-
-N_SFT_EXAMPLES = int(os.environ.get("N_SFT_EXAMPLES", N_SFT_EXAMPLES_DEFAULT))
-SFT_EPOCHS = int(os.environ.get("SFT_EPOCHS", SFT_EPOCHS_DEFAULT))
-N_GRPO_PROMPTS = int(os.environ.get("N_GRPO_PROMPTS", N_GRPO_PROMPTS_DEFAULT))
-GRPO_STEPS = int(os.environ.get("GRPO_STEPS", GRPO_STEPS_DEFAULT))
+    N_SFT_EXAMPLES = 120
+    SFT_EPOCHS = 1
+    N_GRPO_PROMPTS = 80
+    GRPO_STEPS = 40
 
 SFT_OUT = "./sft-warmup"
 SFT_MERGED = "./sft-merged"
 GRPO_OUT = "./grpo-refined"
 
 REQUIRED_KEYS = {
-    "auction_type",
-    "reserve_price",
-    "reveal_reserve",
-    "reveal_competing_bids",
-    "reveal_winner_identity",
-    "reveal_clearing_price",
-    "reveal_bid_distribution",
-    "shill_penalty",
-    "withdrawal_penalty",
-    "collusion_penalty",
-    "coalition_policy",
+    "auction_type", "reserve_price", "reveal_reserve",
+    "reveal_competing_bids", "reveal_winner_identity",
+    "reveal_clearing_price", "reveal_bid_distribution",
+    "shill_penalty", "withdrawal_penalty", "collusion_penalty",
+    "coalition_policy"
 }
 
 
@@ -170,6 +117,7 @@ def format_prompt(obs: dict) -> str:
         "Analyze the current market state and design an optimal mechanism.",
         "",
         f"Round: {obs.get('round_number', 0)} / {obs.get('episode_length', 50)}",
+        "Curriculum Stage: " + str(obs.get('curriculum_stage', 0)),
         "",
         "Your goal is to maximize the composite reward R = W x F x P x S",
     ]
@@ -186,17 +134,11 @@ def format_prompt(obs: dict) -> str:
     lines.extend([
         "",
         "Respond with ONLY a JSON mechanism configuration with these keys:",
-        "  auction_type        : one of \"first_price\" | \"second_price\" | \"vcg\"",
-        "  reserve_price       : float in [0.0, 0.9]",
-        "  reveal_reserve      : bool",
-        "  reveal_competing_bids   : bool",
-        "  reveal_winner_identity  : bool",
-        "  reveal_clearing_price   : bool",
-        "  reveal_bid_distribution : bool",
-        "  shill_penalty       : float in [0.0, 3.0]",
-        "  withdrawal_penalty  : float in [0.0, 3.0]",
-        "  collusion_penalty   : float in [0.0, 3.0]",
-        "  coalition_policy    : one of \"allow\" | \"restrict\" | \"penalize_suspected\" | \"penalize_confirmed\"",
+        "  auction_type: \"first_price\" | \"second_price\" | \"vcg\"",
+        "  reserve_price: float [0.0, 0.9]",
+        "  reveal_reserve, reveal_competing_bids, reveal_winner_identity, reveal_clearing_price, reveal_bid_distribution: bool",
+        "  shill_penalty, withdrawal_penalty, collusion_penalty: float [0.0, 3.0]",
+        "  coalition_policy: \"allow\" | \"restrict\" | \"penalize_suspected\" | \"penalize_confirmed\"",
         "",
         "Output strictly a single JSON object, no commentary.",
     ])
@@ -215,117 +157,136 @@ def random_valid_mechanism() -> dict:
         "shill_penalty": round(random.uniform(0.0, 2.0), 3),
         "withdrawal_penalty": round(random.uniform(0.0, 1.0), 3),
         "collusion_penalty": round(random.uniform(0.0, 2.0), 3),
-        "coalition_policy": random.choice(
-            ["allow", "restrict", "penalize_suspected", "penalize_confirmed"]
-        ),
+        "coalition_policy": random.choice(["allow", "restrict", "penalize_suspected", "penalize_confirmed"]),
     }
 
 
 def generate_sft_examples(n: int) -> List[Dict[str, Any]]:
-    print(f"[data] generating {n} SFT examples (prompt -> valid JSON) ...")
     pairs: List[Dict[str, Any]] = []
-    env = make_env()
-    while len(pairs) < n:
-        obs_dict = _to_dict(env.reset())
-        for _ in range(random.randint(1, 5)):
-            mech = random_valid_mechanism()
-            answer = json.dumps(mech)
-            pairs.append({
-                "messages": [
-                    {"role": "user", "content": format_prompt(obs_dict)},
-                    {"role": "assistant", "content": answer},
-                ]
-            })
-            obs_dict, _, done, _ = env._step_tuple(mech)
-            if done or len(pairs) >= n:
-                break
-    print(f"[data] SFT examples: {len(pairs)}")
+    # Mix stages in SFT
+    for stage in range(5):
+        n_stage = n // 5
+        env = make_env(stage)
+        while len(pairs) < (stage + 1) * n_stage:
+            obs_dict = _to_dict(env.reset())
+            for _ in range(3):
+                mech = random_valid_mechanism()
+                pairs.append({
+                    "messages": [
+                        {"role": "user", "content": format_prompt(obs_dict)},
+                        {"role": "assistant", "content": json.dumps(mech)},
+                    ]
+                })
+                obs = env.step(DaedalusAction(**mech))
+                obs_dict = _to_dict(obs)
+                if obs.done: break
     return pairs[:n]
 
 
 def generate_grpo_prompts(n: int) -> List[Dict[str, str]]:
-    print(f"[data] generating {n} GRPO prompts via env rollout ...")
     prompts: List[Dict[str, str]] = []
-    env = make_env()
-    while len(prompts) < n:
-        obs_dict = _to_dict(env.reset())
-        prompts.append({"prompt": format_prompt(obs_dict)})
-        for _ in range(random.randint(1, 5)):
-            obs_dict, _, done, _ = env._step_tuple(random_valid_mechanism())
-            if done:
-                break
+    for stage in range(5):
+        n_stage = n // 5
+        env = make_env(stage)
+        while len(prompts) < (stage + 1) * n_stage:
+            obs_dict = _to_dict(env.reset())
             prompts.append({"prompt": format_prompt(obs_dict)})
-            if len(prompts) >= n:
-                break
-    print(f"[data] GRPO prompts: {len(prompts[:n])}")
+            for _ in range(3):
+                obs = env.step(DaedalusAction(**random_valid_mechanism()))
+                prompts.append({"prompt": format_prompt(_to_dict(obs))})
+                if obs.done: break
     return prompts[:n]
 
 
 # -------------------------------------------------------------------
-# Reward shaping
+# Decomposed Reward Functions
 # -------------------------------------------------------------------
-_eval_env = make_env()
+_reward_env = make_env()
 
-
-def shaped_reward(text: str) -> float:
-    """
-    Continuous reward landscape with stepping stones:
-      - no JSON braces                  -> -1.0
-      - braces but JSON parse fails     -> -0.5
-      - parses but not a dict           -> -0.3
-      - dict, partial keys              ->  0.2 + 0.3*coverage   (max 0.5)
-      - dict, env step succeeds         -> +format_bonus + env reward
-    """
+@functools.lru_cache(maxsize=128)
+def _get_env_outcome(text: str) -> Optional[dict]:
     j_start = text.find("{")
     j_end = text.rfind("}") + 1
-    if j_start < 0 or j_end <= j_start:
-        return -1.0
+    if j_start < 0 or j_end <= j_start: return None
     try:
         mech = json.loads(text[j_start:j_end])
+        if not isinstance(mech, dict): return None
+        _reward_env.reset()
+        obs = _reward_env.step(DaedalusAction(**mech))
+        return _to_dict(obs)
     except Exception:
-        return -0.5
-    if not isinstance(mech, dict):
-        return -0.3
+        return None
 
-    present = set(mech.keys()) & REQUIRED_KEYS
-    coverage = len(present) / len(REQUIRED_KEYS)
-    format_bonus = 0.2 + 0.3 * coverage  # 0.2 to 0.5
+def reward_format(completions, **kwargs) -> List[float]:
+    rewards = []
+    for content in completions:
+        j_start = content.find("{")
+        j_end = content.rfind("}") + 1
+        if j_start < 0 or j_end <= j_start:
+            rewards.append(-1.0)
+            continue
+        try:
+            mech = json.loads(content[j_start:j_end])
+            coverage = len(set(mech.keys()) & REQUIRED_KEYS) / len(REQUIRED_KEYS)
+            rewards.append(0.5 + 0.5 * coverage)
+        except Exception:
+            rewards.append(-0.5)
+    return rewards
 
-    try:
-        _eval_env.reset()
-        _, env_r, _, _ = _eval_env._step_tuple(mech)
-        return float(format_bonus + env_r)
-    except Exception:
-        return float(format_bonus - 0.2)
+def reward_welfare(completions, **kwargs) -> List[float]:
+    rewards = []
+    for c in completions:
+        outcome = _get_env_outcome(c)
+        if outcome and "metadata" in outcome:
+            rewards.append(float(outcome["metadata"].get("welfare_ratio", 0.0)))
+        else:
+            rewards.append(0.0)
+    return rewards
 
+def reward_fairness(completions, **kwargs) -> List[float]:
+    rewards = []
+    for c in completions:
+        outcome = _get_env_outcome(c)
+        if outcome and "metadata" in outcome:
+            rewards.append(float(outcome["metadata"].get("stability_score", 0.0)))
+        else:
+            rewards.append(0.0)
+    return rewards
 
-def grpo_reward_fn(completions, prompts=None, **kwargs) -> List[float]:
-    return [shaped_reward(c) for c in completions]
+def reward_composite(completions, **kwargs) -> List[float]:
+    rewards = []
+    for c in completions:
+        outcome = _get_env_outcome(c)
+        if outcome:
+            rewards.append(float(outcome.get("reward", 0.0)))
+        else:
+            rewards.append(0.0)
+    return rewards
 
 
 # -------------------------------------------------------------------
-# Phase 1: SFT warmup  ->  Phase 1.5: merge into base
+# Phase 1: SFT warmup (Unsloth)
 # -------------------------------------------------------------------
 def run_sft_and_merge() -> str:
-    """Run SFT, merge the LoRA into the base, save merged model to SFT_MERGED."""
-    import torch
     from datasets import Dataset
-    from peft import LoraConfig
     from trl import SFTConfig, SFTTrainer
-    from transformers import AutoTokenizer
 
-    print("\n" + "=" * 64)
-    print(f"PHASE 1 / SFT warmup  (target ~2-4 min in short mode)")
-    print("=" * 64)
+    print("\n[sft] loading model for SFT warmup...")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=MODEL_ID,
+        max_seq_length=2048,
+        load_in_4bit=True,
+    )
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=16,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_alpha=16,
+        lora_dropout=0,
+        bias="none",
+    )
 
-    for d in (SFT_OUT, SFT_MERGED):
-        if os.path.isdir(d):
-            shutil.rmtree(d)
-
-    examples = generate_sft_examples(N_SFT_EXAMPLES)
-    dataset = Dataset.from_list(examples)
-
-    bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    dataset = Dataset.from_list(generate_sft_examples(N_SFT_EXAMPLES))
 
     cfg = SFTConfig(
         output_dir=SFT_OUT,
@@ -333,98 +294,46 @@ def run_sft_and_merge() -> str:
         per_device_train_batch_size=4,
         gradient_accumulation_steps=2,
         learning_rate=2e-4,
-        warmup_ratio=0.05,
         logging_steps=5,
         save_strategy="no",
-        bf16=bf16_ok,
-        fp16=not bf16_ok and torch.cuda.is_available(),
-        max_length=1500,
+        bf16=True,
+        max_seq_length=2048,
         report_to="none",
-        push_to_hub=False,
-        seed=42,
     )
 
-    peft_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        bias="none",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        task_type="CAUSAL_LM",
-    )
-
-    trainer = SFTTrainer(
-        model=MODEL_ID,
-        args=cfg,
-        train_dataset=dataset,
-        peft_config=peft_config,
-    )
-
+    trainer = SFTTrainer(model=model, tokenizer=tokenizer, train_dataset=dataset, args=cfg)
     trainer.train()
-    trainer.save_model(SFT_OUT)
-    print(f"[sft] adapter saved to {SFT_OUT}")
-
-    # ---- Phase 1.5: merge SFT LoRA into base, save as a regular HF model ----
-    print("\n" + "-" * 64)
-    print("PHASE 1.5 / merging SFT adapter into base weights ...")
-    print("-" * 64)
-
-    merged = trainer.model.merge_and_unload()
-    merged.save_pretrained(SFT_MERGED)
-    AutoTokenizer.from_pretrained(MODEL_ID).save_pretrained(SFT_MERGED)
-    print(f"[sft] merged model saved to {SFT_MERGED}")
-
-    # Free SFT trainer GPU memory before GRPO phase
-    del trainer, merged
+    
+    print("\n[sft] merging LoRA...")
+    model.save_pretrained_merged(SFT_MERGED, tokenizer, save_method="merged_16bit")
+    del trainer, model
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
     return SFT_MERGED
 
 
 # -------------------------------------------------------------------
-# Phase 2: GRPO refinement on the merged model with a FRESH adapter
+# Phase 2: GRPO refinement (Unsloth)
 # -------------------------------------------------------------------
-def run_grpo(merged_model_dir: str) -> Dict[str, Any]:
-    import torch
+def run_grpo(merged_model_dir: str):
     from datasets import Dataset
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from peft import LoraConfig
     from trl import GRPOConfig, GRPOTrainer
 
-    print("\n" + "=" * 64)
-    print("PHASE 2 / GRPO refinement  (target ~6-12 min in short mode)")
-    print(f"          base = merged SFT model at {merged_model_dir}")
-    print("=" * 64)
-
-    # >>> SENTINEL: if you don't see this line in container logs, the new
-    # >>> code did NOT reach the Space (only restart_space was called).
-    print("[grpo v3] using merge+fresh-adapter approach (peft_config -> GRPOTrainer)")
+    print("\n[grpo] loading merged model for GRPO refinement...")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=merged_model_dir,
+        max_seq_length=1024,
+        load_in_4bit=True,
+    )
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=16,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        lora_alpha=16,
+        lora_dropout=0,
+        bias="none",
+    )
 
     dataset = Dataset.from_list(generate_grpo_prompts(N_GRPO_PROMPTS))
-
-    tokenizer = AutoTokenizer.from_pretrained(merged_model_dir)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    dtype = torch.bfloat16 if bf16_ok else torch.float16
-
-    try:
-        model = AutoModelForCausalLM.from_pretrained(merged_model_dir, dtype=dtype)
-    except TypeError:
-        model = AutoModelForCausalLM.from_pretrained(merged_model_dir, torch_dtype=dtype)
-    model.config.use_cache = False  # critical for training stability
-
-    peft_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        bias="none",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        task_type="CAUSAL_LM",
-    )
 
     cfg = GRPOConfig(
         output_dir=GRPO_OUT,
@@ -432,161 +341,42 @@ def run_grpo(merged_model_dir: str) -> Dict[str, Any]:
         per_device_train_batch_size=4,
         gradient_accumulation_steps=2,
         num_generations=4,
-        max_completion_length=140,
+        max_completion_length=160,
         learning_rate=1e-5,
-        warmup_ratio=0.1,
         logging_steps=2,
-        save_steps=max(GRPO_STEPS, 1),
-        save_total_limit=1,
-        bf16=bf16_ok,
-        fp16=not bf16_ok and torch.cuda.is_available(),
-        gradient_checkpointing=False,
+        bf16=True,
         report_to="none",
         push_to_hub=True,
         hub_model_id=HUB_REPO,
-        hub_strategy="end",
-        hub_private_repo=False,
-        seed=42,
     )
 
     trainer = GRPOTrainer(
         model=model,
-        args=cfg,
-        reward_funcs=[grpo_reward_fn],
-        train_dataset=dataset,
-        peft_config=peft_config,
         processing_class=tokenizer,
+        reward_funcs=[reward_format, reward_welfare, reward_fairness, reward_composite],
+        args=cfg,
+        train_dataset=dataset,
     )
 
-    # Print trainable param count AFTER trainer wrapped the model in PEFT.
-    # If this is 0, GRPO will fail at step 0 - we want to see it before training.
-    inner = trainer.model
-    trainable = sum(p.numel() for p in inner.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in inner.parameters())
-    pct = 100 * trainable / total if total else 0.0
-    print(f"[grpo] trainable params: {trainable:,} / {total:,} ({pct:.3f}%)")
-    if trainable == 0:
-        raise RuntimeError(
-            "[grpo] no trainable parameters - peft_config did not wire up. "
-            "Aborting before backward pass crash."
-        )
-
     trainer.train()
-
-    # Capture training history for hackathon plots
-    history = trainer.state.log_history
+    
+    # Save training history
     history_path = os.path.join(GRPO_OUT, "training_history.json")
-    os.makedirs(GRPO_OUT, exist_ok=True)
-    with open(history_path, "w", encoding="utf-8") as f:
-        json.dump({"history": history, "config": {
-            "model_id": MODEL_ID,
-            "n_sft_examples": N_SFT_EXAMPLES,
-            "sft_epochs": SFT_EPOCHS,
-            "n_grpo_prompts": N_GRPO_PROMPTS,
-            "grpo_steps": GRPO_STEPS,
-            "train_mode": TRAIN_MODE,
-        }}, f, indent=2, default=str)
-    print(f"[grpo] training_history.json written: {len(history)} log entries")
+    with open(history_path, "w") as f:
+        json.dump({"history": trainer.state.log_history}, f, indent=2)
 
-    print("[grpo] uploading final adapter + history to Hub ...")
     trainer.push_to_hub()
-
-    # Also push a professional README.md (Model Card)
-    readme_content = f"""---
-base_model: {MODEL_ID}
-library_name: peft
-tags:
-- reinforcement-learning
-- grpo
-- daedalus
-- mechanism-design
-- econ-ai
-model_name: daedalus-designer
----
-
-# DAEDALUS Mechanism Designer
-
-This is a fine-tuned LoRA adapter for `{MODEL_ID}` designed to optimize market auction mechanisms.
-
-### Training details
-It was trained using the **DAEDALUS v3 Pipeline**:
-1. **SFT Warmup**: Learned JSON schema on synthetic market data.
-2. **GRPO Refinement**: Optimized for the **Multiplicative Reward (W×F×P×S)**:
-   - **Welfare (W)**: Allocative efficiency across agents.
-   - **Fairness (F)**: Payment equity (1 - Gini).
-   - **Participation (P)**: Market liquidity.
-   - **Stability (S)**: Resistance to volatility.
-
-The model is trained to defend against adversarial agent behaviors like **Bid Shading**, **Collusion**, and **Strategic Dropout**.
-"""
-    readme_path = os.path.join(GRPO_OUT, "README.md")
-    with open(readme_path, "w", encoding="utf-8") as f:
-        f.write(readme_content)
-
-    # Also push the training_history.json directly so the README plot script can find it.
-    try:
-        from huggingface_hub import HfApi
-        api = HfApi(token=HF_TOKEN)
-        api.upload_file(
-            path_or_fileobj=history_path,
-            path_in_repo="training_history.json",
-            repo_id=HUB_REPO,
-            repo_type="model",
-        )
-        api.upload_file(
-            path_or_fileobj=readme_path,
-            path_in_repo="README.md",
-            repo_id=HUB_REPO,
-            repo_type="model",
-        )
-        print(f"[grpo] training_history.json and README.md pushed to {HUB_REPO}")
-    except Exception as e:
-        print(f"[grpo] WARNING: metadata upload failed: {e}")
-
-    print(f"[grpo] adapter live at https://huggingface.co/{HUB_REPO}")
-    return {"history": history}
+    print(f"[done] model live at {HUB_REPO}")
 
 
-# -------------------------------------------------------------------
-# Auto-pause Space so the Docker restart loop never re-bills us
-# -------------------------------------------------------------------
-def pause_self() -> None:
-    if not (SPACE_ID and HF_TOKEN):
-        return
-    try:
-        from huggingface_hub import HfApi
-        api = HfApi(token=HF_TOKEN)
-        print(f"[shutdown] pausing Space {SPACE_ID} to prevent restart loop ...")
-        api.pause_space(SPACE_ID)
-        print(f"[shutdown] Space paused")
-    except Exception as e:
-        print(f"[shutdown] pause failed: {e}")
-
-
-# -------------------------------------------------------------------
-# Main
-# -------------------------------------------------------------------
-def main() -> None:
-    import torch
-    print("=" * 64)
-    print("DAEDALUS two-phase training (v3 / merge+fresh-adapter)")
-    print(f"  train_mode      : {TRAIN_MODE}")
-    print(f"  base model      : {MODEL_ID}")
-    print(f"  hub destination : {HUB_REPO}")
-    print(f"  sft examples    : {N_SFT_EXAMPLES} x {SFT_EPOCHS} epochs")
-    print(f"  grpo steps      : {GRPO_STEPS}  ({N_GRPO_PROMPTS} prompts)")
-    print(f"  cuda            : {torch.cuda.is_available()}  "
-          f"device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'}")
-    print("=" * 64)
-
-    merged_dir = run_sft_and_merge()
-    run_grpo(merged_dir)
-
+def main():
+    if os.path.exists(SFT_MERGED): shutil.rmtree(SFT_MERGED)
+    merged_path = run_sft_and_merge()
+    run_grpo(merged_path)
 
 if __name__ == "__main__":
     try:
         main()
-        print("[done] training pipeline completed successfully")
     except Exception:
         traceback.print_exc()
     finally:

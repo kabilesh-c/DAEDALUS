@@ -69,7 +69,7 @@ class DaedalusEnvironment:
         Returns:
             Observation dict for the LLM agent.
         """
-        self.agents = create_default_population()
+        self.agents = create_default_population(stage=self.curriculum_stage)
         self.mechanism = MechanismConfig()
         self.round = 0
         self.history = []

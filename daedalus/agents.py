@@ -231,16 +231,36 @@ AGENT_CLASSES = {
 }
 
 
-def create_default_population() -> List[SubAgent]:
-    """Create the default 8-agent population."""
+def create_default_population(stage: int = 0) -> List[SubAgent]:
+    """
+    Create an 8-agent population based on the curriculum stage.
+    Stage 0 is easiest (truthful baseline); Stage 4 is full adversarial.
+    """
+    # Base: 8 truthful agents
     agents = [
-        TruthfulBidder(AgentState(agent_id=0, agent_type="truthful")),
-        TruthfulBidder(AgentState(agent_id=1, agent_type="truthful")),
-        BidShader(AgentState(agent_id=2, agent_type="shader")),
-        BidShader(AgentState(agent_id=3, agent_type="shader")),
-        Colluder(AgentState(agent_id=4, agent_type="colluder", partner_id=5, collusion_turn=False)),
-        Colluder(AgentState(agent_id=5, agent_type="colluder", partner_id=4, collusion_turn=True)),
-        StrategicDropout(AgentState(agent_id=6, agent_type="dropout", dropout_threshold=0.08)),
-        BudgetExploiter(AgentState(agent_id=7, agent_type="exploiter", budget=2.5)),
+        TruthfulBidder(AgentState(agent_id=i, agent_type="truthful"))
+        for i in range(8)
     ]
+
+    # Stage 1: Add 2 Shaders
+    if stage >= 1:
+        agents[2] = BidShader(AgentState(agent_id=2, agent_type="shader"))
+        agents[3] = BidShader(AgentState(agent_id=3, agent_type="shader"))
+
+    # Stage 2: Add 2 strategic Dropouts
+    if stage >= 2:
+        agents[6] = StrategicDropout(AgentState(agent_id=6, agent_type="dropout", dropout_threshold=0.08))
+        # Replacement at index 1
+        agents[1] = StrategicDropout(AgentState(agent_id=1, agent_type="dropout", dropout_threshold=0.12))
+
+    # Stage 3: Add 2 Colluders
+    if stage >= 3:
+        agents[4] = Colluder(AgentState(agent_id=4, agent_type="colluder", partner_id=5, collusion_turn=False))
+        agents[5] = Colluder(AgentState(agent_id=5, agent_type="colluder", partner_id=4, collusion_turn=True))
+
+    # Stage 4: Add 2 Budget Exploiters
+    if stage >= 4:
+        agents[7] = BudgetExploiter(AgentState(agent_id=7, agent_type="exploiter", budget=2.5))
+        agents[0] = BudgetExploiter(AgentState(agent_id=0, agent_type="exploiter", budget=2.0))
+
     return agents

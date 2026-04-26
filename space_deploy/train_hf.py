@@ -43,6 +43,11 @@ import sys
 import traceback
 from typing import Any, Dict, List
 
+from dotenv import load_dotenv
+
+# Load environment variables from .env
+load_dotenv()
+
 
 # -------------------------------------------------------------------
 # Auth
@@ -68,7 +73,48 @@ for candidate in (SCRIPT_DIR, "/workspace", "/app"):
     if os.path.isdir(os.path.join(candidate, "daedalus")) and candidate not in sys.path:
         sys.path.insert(0, candidate)
 
-from daedalus.env import DaedalusEnvironment  # noqa: E402
+# Use the OpenEnv-compliant class wherever possible. We fall back to the
+# legacy tuple-returning class only if openenv-core fails to import (e.g.
+# when running on a machine without it during local debugging).
+try:
+    from daedalus import DaedalusOpenEnv, DaedalusAction  # noqa: E402
+
+    USE_OPENENV = True
+    print("[env] using DaedalusOpenEnv (inherits openenv.core.Environment)")
+except Exception as _exc:  # noqa: BLE001
+    print(f"[env] WARNING: falling back to legacy DaedalusEnvironment: {_exc}")
+    from daedalus.env import DaedalusEnvironment  # noqa: E402
+
+    USE_OPENENV = False
+
+
+def _to_dict(obs: Any) -> dict:
+    """Normalize an observation (Pydantic OpenEnv obj OR legacy dict) to a dict."""
+    if isinstance(obs, dict):
+        return obs
+    if hasattr(obs, "model_dump"):
+        return obs.model_dump()
+    if hasattr(obs, "to_dict"):
+        return obs.to_dict()
+    return dict(obs)
+
+
+def make_env() -> Any:
+    """Return an env where:
+      - `env.reset()` returns the canonical OpenEnv observation
+        (DaedalusObservation Pydantic model). Use `_to_dict(obs)` if
+        you need a plain dict for prompt formatting.
+      - `env._step_tuple(action)` returns the legacy
+        `(obs_dict, reward, done, info)` tuple so the training-data
+        loops can stay short.
+    """
+    if USE_OPENENV:
+        env = DaedalusOpenEnv()
+        env._step_tuple = env.step_tuple
+        return env
+    env = DaedalusEnvironment()
+    env._step_tuple = env.step
+    return env
 
 
 # -------------------------------------------------------------------
@@ -178,19 +224,19 @@ def random_valid_mechanism() -> dict:
 def generate_sft_examples(n: int) -> List[Dict[str, Any]]:
     print(f"[data] generating {n} SFT examples (prompt -> valid JSON) ...")
     pairs: List[Dict[str, Any]] = []
-    env = DaedalusEnvironment()
+    env = make_env()
     while len(pairs) < n:
-        obs = env.reset()
+        obs_dict = _to_dict(env.reset())
         for _ in range(random.randint(1, 5)):
             mech = random_valid_mechanism()
             answer = json.dumps(mech)
             pairs.append({
                 "messages": [
-                    {"role": "user", "content": format_prompt(obs)},
+                    {"role": "user", "content": format_prompt(obs_dict)},
                     {"role": "assistant", "content": answer},
                 ]
             })
-            obs, _, done, _ = env.step(mech)
+            obs_dict, _, done, _ = env._step_tuple(mech)
             if done or len(pairs) >= n:
                 break
     print(f"[data] SFT examples: {len(pairs)}")
@@ -200,15 +246,15 @@ def generate_sft_examples(n: int) -> List[Dict[str, Any]]:
 def generate_grpo_prompts(n: int) -> List[Dict[str, str]]:
     print(f"[data] generating {n} GRPO prompts via env rollout ...")
     prompts: List[Dict[str, str]] = []
-    env = DaedalusEnvironment()
+    env = make_env()
     while len(prompts) < n:
-        obs = env.reset()
-        prompts.append({"prompt": format_prompt(obs)})
+        obs_dict = _to_dict(env.reset())
+        prompts.append({"prompt": format_prompt(obs_dict)})
         for _ in range(random.randint(1, 5)):
-            obs, _, done, _ = env.step(random_valid_mechanism())
+            obs_dict, _, done, _ = env._step_tuple(random_valid_mechanism())
             if done:
                 break
-            prompts.append({"prompt": format_prompt(obs)})
+            prompts.append({"prompt": format_prompt(obs_dict)})
             if len(prompts) >= n:
                 break
     print(f"[data] GRPO prompts: {len(prompts[:n])}")
@@ -218,7 +264,7 @@ def generate_grpo_prompts(n: int) -> List[Dict[str, str]]:
 # -------------------------------------------------------------------
 # Reward shaping
 # -------------------------------------------------------------------
-_eval_env = DaedalusEnvironment()
+_eval_env = make_env()
 
 
 def shaped_reward(text: str) -> float:
@@ -247,7 +293,7 @@ def shaped_reward(text: str) -> float:
 
     try:
         _eval_env.reset()
-        _, env_r, _, _ = _eval_env.step(mech)
+        _, env_r, _, _ = _eval_env._step_tuple(mech)
         return float(format_bonus + env_r)
     except Exception:
         return float(format_bonus - 0.2)
@@ -445,18 +491,57 @@ def run_grpo(merged_model_dir: str) -> Dict[str, Any]:
     print("[grpo] uploading final adapter + history to Hub ...")
     trainer.push_to_hub()
 
+    # Also push a professional README.md (Model Card)
+    readme_content = f"""---
+base_model: {MODEL_ID}
+library_name: peft
+tags:
+- reinforcement-learning
+- grpo
+- daedalus
+- mechanism-design
+- econ-ai
+model_name: daedalus-designer
+---
+
+# DAEDALUS Mechanism Designer
+
+This is a fine-tuned LoRA adapter for `{MODEL_ID}` designed to optimize market auction mechanisms.
+
+### Training details
+It was trained using the **DAEDALUS v3 Pipeline**:
+1. **SFT Warmup**: Learned JSON schema on synthetic market data.
+2. **GRPO Refinement**: Optimized for the **Multiplicative Reward (W×F×P×S)**:
+   - **Welfare (W)**: Allocative efficiency across agents.
+   - **Fairness (F)**: Payment equity (1 - Gini).
+   - **Participation (P)**: Market liquidity.
+   - **Stability (S)**: Resistance to volatility.
+
+The model is trained to defend against adversarial agent behaviors like **Bid Shading**, **Collusion**, and **Strategic Dropout**.
+"""
+    readme_path = os.path.join(GRPO_OUT, "README.md")
+    with open(readme_path, "w", encoding="utf-8") as f:
+        f.write(readme_content)
+
     # Also push the training_history.json directly so the README plot script can find it.
     try:
         from huggingface_hub import HfApi
-        HfApi(token=HF_TOKEN).upload_file(
+        api = HfApi(token=HF_TOKEN)
+        api.upload_file(
             path_or_fileobj=history_path,
             path_in_repo="training_history.json",
             repo_id=HUB_REPO,
             repo_type="model",
         )
-        print(f"[grpo] training_history.json pushed to {HUB_REPO}")
+        api.upload_file(
+            path_or_fileobj=readme_path,
+            path_in_repo="README.md",
+            repo_id=HUB_REPO,
+            repo_type="model",
+        )
+        print(f"[grpo] training_history.json and README.md pushed to {HUB_REPO}")
     except Exception as e:
-        print(f"[grpo] WARNING: history upload failed: {e}")
+        print(f"[grpo] WARNING: metadata upload failed: {e}")
 
     print(f"[grpo] adapter live at https://huggingface.co/{HUB_REPO}")
     return {"history": history}
