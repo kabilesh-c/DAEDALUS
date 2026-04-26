@@ -1,28 +1,36 @@
 """
-DAEDALUS Training - Qwen2.5-0.5B + Unsloth + GRPO Multi-Reward (v4)
-=====================================================================
-Enhanced pipeline for the OpenEnv Hackathon:
-    - Unsloth for 2x-4x faster RL training.
-    - Decomposed Rewards (Format, Welfare, Fairness, Participation).
-    - OpenEnv-compliant environment interaction.
-    - Stage-based Curriculum.
+DAEDALUS Training v4 - Unsloth + Qwen2.5-0.5B + GRPO (single-adapter pipeline)
+==============================================================================
+
+What changed vs v3:
+    * Single LoRA on the original Qwen base (no SFT-merge step). The exported
+      adapter sits cleanly on top of `Qwen/Qwen2.5-0.5B-Instruct` so any
+      consumer (e.g. server.py) can load it without juggling intermediate
+      checkpoints.
+    * Uses unsloth's pre-quantized `unsloth/Qwen2.5-0.5B-Instruct-bnb-4bit`
+      to skip on-the-fly 4-bit quantization (~2x faster startup, lower RAM).
+    * After GRPO completes, the LoRA is merged and the full 16-bit model is
+      pushed to the hub. server.py can now do a one-liner load.
+    * Adds `pause_self()` so the script no longer NameErrors on exit.
+    * Smaller `max_seq_length` (1024) and bigger micro-batch since the model
+      is tiny and the prompts are short.
+    * Sentinel log line: `[grpo v4] single-adapter on base + push merged`.
 """
 
 from __future__ import annotations
 
+import functools
 import gc
 import json
 import os
 import random
-import shutil
 import sys
+import time
 import traceback
-import functools
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
-# Load environment variables from .env
 load_dotenv()
 
 
@@ -34,6 +42,7 @@ SPACE_ID = os.environ.get("SPACE_ID")
 if HF_TOKEN:
     try:
         from huggingface_hub import login
+
         login(token=HF_TOKEN, add_to_git_credential=False)
         print("[auth] logged into Hugging Face from HF_TOKEN env var")
     except Exception as e:
@@ -43,11 +52,11 @@ else:
 
 
 # -------------------------------------------------------------------
-# Unsloth & TRL Patching
+# Unsloth & TRL Patching (must happen before TRL import)
 # -------------------------------------------------------------------
-# We patch before importing TRL to ensure Unsloth speedups are applied.
-from unsloth import FastLanguageModel, PatchFastRL
-PatchFastRL("grpo", "unsloth/Qwen2.5-0.5B-Instruct")
+from unsloth import FastLanguageModel, PatchFastRL  # noqa: E402
+
+PatchFastRL("grpo", "unsloth/Qwen2.5-0.5B-Instruct-bnb-4bit")
 
 
 # -------------------------------------------------------------------
@@ -81,30 +90,32 @@ def make_env(stage: int = 0) -> Any:
 # Config
 # -------------------------------------------------------------------
 TRAIN_MODE = os.environ.get("TRAIN_MODE", "short").lower()
-MODEL_ID = os.environ.get("BASE_MODEL", "unsloth/Qwen2.5-0.5B-Instruct")
+# We load the unsloth pre-quantized variant for 2x faster startup, but the
+# resulting LoRA is fully compatible with the upstream `Qwen/Qwen2.5-0.5B-Instruct`.
+MODEL_ID = os.environ.get("BASE_MODEL", "unsloth/Qwen2.5-0.5B-Instruct-bnb-4bit")
 HUB_REPO = os.environ.get("HUB_MODEL_ID", "kabilesh-c/daedalus-designer")
+PUSH_MERGED = os.environ.get("PUSH_MERGED", "1") not in ("0", "false", "False")
 
 if TRAIN_MODE == "long":
-    N_SFT_EXAMPLES = 300
+    N_SFT_EXAMPLES = 400
     SFT_EPOCHS = 2
-    N_GRPO_PROMPTS = 200
-    GRPO_STEPS = 120
+    N_GRPO_PROMPTS = 240
+    GRPO_STEPS = 160
 else:
-    N_SFT_EXAMPLES = 120
+    N_SFT_EXAMPLES = 160
     SFT_EPOCHS = 1
-    N_GRPO_PROMPTS = 80
-    GRPO_STEPS = 40
+    N_GRPO_PROMPTS = 96
+    GRPO_STEPS = 60
 
-SFT_OUT = "./sft-warmup"
-SFT_MERGED = "./sft-merged"
-GRPO_OUT = "./grpo-refined"
+OUT_DIR = "./daedalus-lora"
+MAX_SEQ_LEN = 1024  # mechanism prompts + JSON completions easily fit in 1k
 
 REQUIRED_KEYS = {
     "auction_type", "reserve_price", "reveal_reserve",
     "reveal_competing_bids", "reveal_winner_identity",
     "reveal_clearing_price", "reveal_bid_distribution",
     "shill_penalty", "withdrawal_penalty", "collusion_penalty",
-    "coalition_policy"
+    "coalition_policy",
 }
 
 
@@ -163,9 +174,8 @@ def random_valid_mechanism() -> dict:
 
 def generate_sft_examples(n: int) -> List[Dict[str, Any]]:
     pairs: List[Dict[str, Any]] = []
-    # Mix stages in SFT
     for stage in range(5):
-        n_stage = n // 5
+        n_stage = max(1, n // 5)
         env = make_env(stage)
         while len(pairs) < (stage + 1) * n_stage:
             obs_dict = _to_dict(env.reset())
@@ -179,14 +189,15 @@ def generate_sft_examples(n: int) -> List[Dict[str, Any]]:
                 })
                 obs = env.step(DaedalusAction(**mech))
                 obs_dict = _to_dict(obs)
-                if obs.done: break
+                if obs.done:
+                    break
     return pairs[:n]
 
 
 def generate_grpo_prompts(n: int) -> List[Dict[str, str]]:
     prompts: List[Dict[str, str]] = []
     for stage in range(5):
-        n_stage = n // 5
+        n_stage = max(1, n // 5)
         env = make_env(stage)
         while len(prompts) < (stage + 1) * n_stage:
             obs_dict = _to_dict(env.reset())
@@ -194,7 +205,8 @@ def generate_grpo_prompts(n: int) -> List[Dict[str, str]]:
             for _ in range(3):
                 obs = env.step(DaedalusAction(**random_valid_mechanism()))
                 prompts.append({"prompt": format_prompt(_to_dict(obs))})
-                if obs.done: break
+                if obs.done:
+                    break
     return prompts[:n]
 
 
@@ -203,19 +215,23 @@ def generate_grpo_prompts(n: int) -> List[Dict[str, str]]:
 # -------------------------------------------------------------------
 _reward_env = make_env()
 
-@functools.lru_cache(maxsize=128)
+
+@functools.lru_cache(maxsize=256)
 def _get_env_outcome(text: str) -> Optional[dict]:
     j_start = text.find("{")
     j_end = text.rfind("}") + 1
-    if j_start < 0 or j_end <= j_start: return None
+    if j_start < 0 or j_end <= j_start:
+        return None
     try:
         mech = json.loads(text[j_start:j_end])
-        if not isinstance(mech, dict): return None
+        if not isinstance(mech, dict):
+            return None
         _reward_env.reset()
         obs = _reward_env.step(DaedalusAction(**mech))
         return _to_dict(obs)
     except Exception:
         return None
+
 
 def reward_format(completions, **kwargs) -> List[float]:
     rewards = []
@@ -233,121 +249,130 @@ def reward_format(completions, **kwargs) -> List[float]:
             rewards.append(-0.5)
     return rewards
 
+
 def reward_welfare(completions, **kwargs) -> List[float]:
-    rewards = []
+    out = []
     for c in completions:
         outcome = _get_env_outcome(c)
         if outcome and "metadata" in outcome:
-            rewards.append(float(outcome["metadata"].get("welfare_ratio", 0.0)))
+            out.append(float(outcome["metadata"].get("welfare_ratio", 0.0)))
         else:
-            rewards.append(0.0)
-    return rewards
+            out.append(0.0)
+    return out
+
 
 def reward_fairness(completions, **kwargs) -> List[float]:
-    rewards = []
+    out = []
     for c in completions:
         outcome = _get_env_outcome(c)
         if outcome and "metadata" in outcome:
-            rewards.append(float(outcome["metadata"].get("stability_score", 0.0)))
+            out.append(float(outcome["metadata"].get("stability_score", 0.0)))
         else:
-            rewards.append(0.0)
-    return rewards
+            out.append(0.0)
+    return out
+
 
 def reward_composite(completions, **kwargs) -> List[float]:
-    rewards = []
+    out = []
     for c in completions:
         outcome = _get_env_outcome(c)
         if outcome:
-            rewards.append(float(outcome.get("reward", 0.0)))
+            out.append(float(outcome.get("reward", 0.0)))
         else:
-            rewards.append(0.0)
-    return rewards
+            out.append(0.0)
+    return out
 
 
 # -------------------------------------------------------------------
-# Phase 1: SFT warmup (Unsloth)
+# Single-adapter training pipeline (SFT then GRPO on the SAME LoRA)
 # -------------------------------------------------------------------
-def run_sft_and_merge() -> str:
+def build_model_and_tokenizer():
+    """Load Qwen 0.5B (4-bit) and attach a single LoRA used for both SFT and GRPO."""
+    print("[model] loading base via Unsloth (pre-quantized 4-bit)...")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=MODEL_ID,
+        max_seq_length=MAX_SEQ_LEN,
+        load_in_4bit=True,
+        dtype=None,  # let unsloth choose bf16/fp16
+    )
+    print("[model] attaching LoRA (r=16, all attn + MLP)...")
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=16,
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        lora_alpha=32,
+        lora_dropout=0.05,
+        bias="none",
+        use_gradient_checkpointing="unsloth",
+        random_state=42,
+    )
+    return model, tokenizer
+
+
+def run_sft(model, tokenizer):
+    """Phase 1: teach the JSON output format via supervised fine-tuning."""
     from datasets import Dataset
     from trl import SFTConfig, SFTTrainer
 
-    print("\n[sft] loading model for SFT warmup...")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=MODEL_ID,
-        max_seq_length=2048,
-        load_in_4bit=True,
-    )
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=16,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        lora_alpha=16,
-        lora_dropout=0,
-        bias="none",
-    )
-
+    print(f"[sft] generating {N_SFT_EXAMPLES} synthetic (prompt, mechanism) pairs ...")
     dataset = Dataset.from_list(generate_sft_examples(N_SFT_EXAMPLES))
 
     cfg = SFTConfig(
-        output_dir=SFT_OUT,
+        output_dir=OUT_DIR + "-sft",
         num_train_epochs=SFT_EPOCHS,
-        per_device_train_batch_size=4,
+        per_device_train_batch_size=8,
         gradient_accumulation_steps=2,
         learning_rate=2e-4,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.05,
         logging_steps=5,
         save_strategy="no",
         bf16=True,
-        max_seq_length=2048,
+        max_seq_length=MAX_SEQ_LEN,
         report_to="none",
+        seed=42,
     )
 
-    trainer = SFTTrainer(model=model, tokenizer=tokenizer, train_dataset=dataset, args=cfg)
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=dataset,
+        args=cfg,
+    )
+    print("[sft] training ...")
     trainer.train()
-    
-    print("\n[sft] merging LoRA...")
-    model.save_pretrained_merged(SFT_MERGED, tokenizer, save_method="merged_16bit")
-    del trainer, model
+
+    del trainer
     gc.collect()
-    return SFT_MERGED
+    return model
 
 
-# -------------------------------------------------------------------
-# Phase 2: GRPO refinement (Unsloth)
-# -------------------------------------------------------------------
-def run_grpo(merged_model_dir: str):
+def run_grpo(model, tokenizer):
+    """Phase 2: GRPO refinement on the SAME LoRA we just SFT'd."""
     from datasets import Dataset
     from trl import GRPOConfig, GRPOTrainer
 
-    print("\n[grpo] loading merged model for GRPO refinement...")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=merged_model_dir,
-        max_seq_length=1024,
-        load_in_4bit=True,
-    )
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=16,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        lora_alpha=16,
-        lora_dropout=0,
-        bias="none",
-    )
-
+    print("[grpo v4] using single-adapter (no merge) approach")
+    print(f"[grpo] generating {N_GRPO_PROMPTS} prompts ...")
     dataset = Dataset.from_list(generate_grpo_prompts(N_GRPO_PROMPTS))
 
     cfg = GRPOConfig(
-        output_dir=GRPO_OUT,
+        output_dir=OUT_DIR,
         max_steps=GRPO_STEPS,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=2,
         num_generations=4,
-        max_completion_length=160,
+        max_completion_length=192,
         learning_rate=1e-5,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.1,
         logging_steps=2,
         bf16=True,
         report_to="none",
-        push_to_hub=True,
-        hub_model_id=HUB_REPO,
+        seed=42,
     )
 
     trainer = GRPOTrainer(
@@ -357,22 +382,72 @@ def run_grpo(merged_model_dir: str):
         args=cfg,
         train_dataset=dataset,
     )
-
+    print("[grpo] training ...")
     trainer.train()
-    
-    # Save training history
-    history_path = os.path.join(GRPO_OUT, "training_history.json")
+
+    history_path = os.path.join(OUT_DIR, "training_history.json")
+    os.makedirs(OUT_DIR, exist_ok=True)
     with open(history_path, "w") as f:
         json.dump({"history": trainer.state.log_history}, f, indent=2)
+    print(f"[grpo] saved log history to {history_path}")
 
-    trainer.push_to_hub()
-    print(f"[done] model live at {HUB_REPO}")
+    return trainer.model
+
+
+def push_to_hub(model, tokenizer):
+    """Push merged 16-bit weights so consumers can load with one line."""
+    if not HF_TOKEN:
+        print("[push] skipped: HF_TOKEN not set")
+        return
+
+    if PUSH_MERGED:
+        print(f"[push] merging LoRA + uploading FULL 16-bit model to {HUB_REPO} ...")
+        try:
+            model.push_to_hub_merged(
+                HUB_REPO,
+                tokenizer,
+                save_method="merged_16bit",
+                token=HF_TOKEN,
+            )
+            print(f"[done] merged model live at https://huggingface.co/{HUB_REPO}")
+            return
+        except Exception as e:
+            print(f"[push] merged upload failed ({e}); falling back to LoRA-only push")
+
+    print(f"[push] uploading LoRA adapter to {HUB_REPO} ...")
+    model.push_to_hub(HUB_REPO, token=HF_TOKEN)
+    tokenizer.push_to_hub(HUB_REPO, token=HF_TOKEN)
+    print(f"[done] adapter live at https://huggingface.co/{HUB_REPO}")
+
+
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+def pause_self() -> None:
+    """When running inside a HF Space, pause the Space so it stops billing.
+
+    Outside of a Space (or on auth failure) this is a harmless no-op.
+    """
+    if not SPACE_ID or not HF_TOKEN:
+        print("[pause] not in a Space (or no token); skipping pause_space")
+        return
+    try:
+        from huggingface_hub import HfApi
+
+        HfApi(token=HF_TOKEN).pause_space(SPACE_ID)
+        print(f"[pause] paused Space {SPACE_ID}")
+    except Exception as e:
+        print(f"[pause] pause_space failed: {e}")
 
 
 def main():
-    if os.path.exists(SFT_MERGED): shutil.rmtree(SFT_MERGED)
-    merged_path = run_sft_and_merge()
-    run_grpo(merged_path)
+    t0 = time.time()
+    model, tokenizer = build_model_and_tokenizer()
+    model = run_sft(model, tokenizer)
+    model = run_grpo(model, tokenizer)
+    push_to_hub(model, tokenizer)
+    print(f"[done] total wall time: {(time.time() - t0) / 60:.1f} min")
+
 
 if __name__ == "__main__":
     try:

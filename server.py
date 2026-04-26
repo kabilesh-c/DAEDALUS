@@ -1,28 +1,49 @@
 """
-DAEDALUS Server — FastAPI wrapper for the OpenEnv environment.
+DAEDALUS Server - FastAPI wrapper for the OpenEnv environment.
 Deploy as a Hugging Face Space or run locally with uvicorn.
 
 Usage:
     uvicorn server:app --host 0.0.0.0 --port 8000
 """
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from __future__ import annotations
+
 import json
 import os
+import threading
+import traceback
+from typing import Dict, Optional
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from peft import PeftModel
+from pydantic import BaseModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from daedalus.env import DaedalusEnvironment
 from daedalus.models import MechanismConfig
 
+# Optional HF login when a token is present (private repos / rate limits)
+_HF_TOKEN = os.environ.get("HF_TOKEN")
+if _HF_TOKEN:
+    try:
+        from huggingface_hub import login
+
+        login(token=_HF_TOKEN, add_to_git_credential=False)
+        print("[auth] logged into Hugging Face from HF_TOKEN env var")
+    except Exception as e:
+        print(f"[auth] login failed (continuing anonymously): {e}")
+
+
 app = FastAPI(
     title="DAEDALUS Environment",
-    description="Mechanism Design via Adversarial RL — OpenEnv compliant",
+    description="Mechanism Design via Adversarial RL - OpenEnv compliant",
     version="1.0.0",
 )
 
@@ -33,7 +54,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global environment instance (per-session in production)
 environments: Dict[str, DaedalusEnvironment] = {}
 
 # --- AI Designer Loading ---
@@ -43,38 +63,110 @@ ADAPTER_ID = os.environ.get("DAEDALUS_ADAPTER", "kabilesh-c/daedalus-designer")
 DESIGNER_MODEL = None
 DESIGNER_TOKENIZER = None
 
+# status: "idle" | "loading" | "ready" | "error"
+DESIGNER_STATUS: Dict[str, Optional[str]] = {
+    "status": "idle",
+    "base_model": BASE_MODEL_ID,
+    "adapter": ADAPTER_ID,
+    "device": None,
+    "error": None,
+}
+_DESIGNER_LOCK = threading.Lock()
 
-def load_designer():
-    """Lazy-load base model + LoRA adapter on first /api/design call."""
+
+def _from_pretrained_compat(cls, model_id: str, **kwargs):
+    """transformers >=4.45 prefers `dtype=`, older builds want `torch_dtype=`."""
+    try:
+        return cls.from_pretrained(model_id, **kwargs)
+    except TypeError:
+        if "dtype" in kwargs:
+            kwargs["torch_dtype"] = kwargs.pop("dtype")
+        return cls.from_pretrained(model_id, **kwargs)
+
+
+def _load_designer_blocking() -> None:
+    """Load `kabilesh-c/daedalus-designer`.
+
+    The repo may be either:
+      (a) a full merged model (v4 trainer output)  -> single from_pretrained
+      (b) a LoRA adapter sitting on Qwen2.5-0.5B-Instruct (v3 trainer output)
+          -> base + PeftModel.from_pretrained
+
+    We try (a) first, fall back to (b) if it looks like an adapter repo.
+    """
     global DESIGNER_MODEL, DESIGNER_TOKENIZER
-    if DESIGNER_MODEL is None:
-        print(f"[designer] loading base={BASE_MODEL_ID} adapter={ADAPTER_ID} ...")
 
-        DESIGNER_TOKENIZER = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
-        if DESIGNER_TOKENIZER.pad_token is None:
-            DESIGNER_TOKENIZER.pad_token = DESIGNER_TOKENIZER.eos_token
-
+    with _DESIGNER_LOCK:
+        if DESIGNER_MODEL is not None:
+            return
+        DESIGNER_STATUS["status"] = "loading"
+        DESIGNER_STATUS["error"] = None
         dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        device_map = "auto" if torch.cuda.is_available() else None
+
+        # ---- Path A: full merged model in ADAPTER_ID itself ---------------
         try:
-            base_model = AutoModelForCausalLM.from_pretrained(
+            print(f"[designer] trying full-model load from {ADAPTER_ID} ...")
+            tokenizer = AutoTokenizer.from_pretrained(ADAPTER_ID)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            model = _from_pretrained_compat(
+                AutoModelForCausalLM,
+                ADAPTER_ID,
+                dtype=dtype,
+                device_map=device_map,
+            )
+            model.eval()
+            DESIGNER_TOKENIZER = tokenizer
+            DESIGNER_MODEL = model
+            DESIGNER_STATUS["status"] = "ready"
+            DESIGNER_STATUS["device"] = str(next(model.parameters()).device)
+            print(f"[designer] ready (full model) on {DESIGNER_STATUS['device']}")
+            return
+        except Exception as e_full:
+            print(f"[designer] full-model load failed ({e_full}); trying LoRA adapter on {BASE_MODEL_ID} ...")
+
+        # ---- Path B: LoRA adapter on top of BASE_MODEL_ID -----------------
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            base_model = _from_pretrained_compat(
+                AutoModelForCausalLM,
                 BASE_MODEL_ID,
                 dtype=dtype,
-                device_map="auto" if torch.cuda.is_available() else None,
+                device_map=device_map,
             )
-        except TypeError:
-            base_model = AutoModelForCausalLM.from_pretrained(
-                BASE_MODEL_ID,
-                torch_dtype=dtype,
-                device_map="auto" if torch.cuda.is_available() else None,
-            )
-        DESIGNER_MODEL = PeftModel.from_pretrained(base_model, ADAPTER_ID)
-        DESIGNER_MODEL.eval()
-        print("[designer] ready")
-    return DESIGNER_MODEL, DESIGNER_TOKENIZER
+            model = PeftModel.from_pretrained(base_model, ADAPTER_ID)
+            model.eval()
+            DESIGNER_TOKENIZER = tokenizer
+            DESIGNER_MODEL = model
+            DESIGNER_STATUS["status"] = "ready"
+            DESIGNER_STATUS["device"] = str(next(model.parameters()).device)
+            print(f"[designer] ready (base + LoRA) on {DESIGNER_STATUS['device']}")
+        except Exception as e:
+            DESIGNER_STATUS["status"] = "error"
+            DESIGNER_STATUS["error"] = f"{type(e).__name__}: {e}"
+            traceback.print_exc()
+            print(f"[designer] LOAD FAILED: {DESIGNER_STATUS['error']}")
+
+
+def _kickoff_designer_load() -> None:
+    """Start loading in a background thread so /health works immediately."""
+    if DESIGNER_STATUS["status"] in ("loading", "ready"):
+        return
+    t = threading.Thread(target=_load_designer_blocking, daemon=True)
+    t.start()
+
+
+@app.on_event("startup")
+async def _startup_warmup() -> None:
+    """Begin downloading + loading the designer the moment the server boots."""
+    _kickoff_designer_load()
 
 
 def _build_prompt(observation: dict) -> str:
-    """Mirror train_hf.py::_format_prompt so inference matches training."""
+    """Mirror train_hf.py::format_prompt so inference matches training."""
     lines = [
         "You are a mechanism designer for a market auction system.",
         "Analyze the current market state and design an optimal mechanism.",
@@ -171,17 +263,64 @@ async def step(req: StepRequest) -> StepResponse:
     obs, reward, done, info = env.step(req.action)
 
     if done:
-        # Clean up finished sessions
         del environments[req.session_id]
 
     return StepResponse(observation=obs, reward=reward, done=done, info=info)
 
 
+@app.get("/api/designer/status")
+async def designer_status() -> dict:
+    """Tell the frontend whether the AI designer is ready, loading, or errored."""
+    return dict(DESIGNER_STATUS)
+
+
+@app.post("/api/designer/warmup")
+async def designer_warmup() -> dict:
+    """Trigger (or retry) loading the designer."""
+    if DESIGNER_STATUS["status"] == "error":
+        # Allow retry by clearing state
+        DESIGNER_STATUS["status"] = "idle"
+        DESIGNER_STATUS["error"] = None
+    _kickoff_designer_load()
+    return dict(DESIGNER_STATUS)
+
+
 @app.post("/api/design")
-async def design_mechanism(observation: dict):
-    """Ask the trained AI Designer for a mechanism. Falls back to default if training is incomplete."""
+async def design_mechanism(observation: dict) -> dict:
+    """
+    Ask the trained AI Designer for a mechanism.
+
+    Always returns:
+        {
+          "mechanism": {...},
+          "source":    "ai" | "fallback",
+          "status":    "ready" | "loading" | "error",
+          "error":     <string or null>,
+        }
+    """
+    status = DESIGNER_STATUS["status"]
+
+    if status in ("idle", "loading"):
+        if status == "idle":
+            _kickoff_designer_load()
+        return {
+            "mechanism": _DEFAULT_MECHANISM,
+            "source": "fallback",
+            "status": DESIGNER_STATUS["status"],
+            "error": "Designer is still loading; using safe default for this step.",
+        }
+
+    if status == "error" or DESIGNER_MODEL is None or DESIGNER_TOKENIZER is None:
+        return {
+            "mechanism": _DEFAULT_MECHANISM,
+            "source": "fallback",
+            "status": "error",
+            "error": DESIGNER_STATUS["error"] or "Designer model is not available.",
+        }
+
     try:
-        model, tokenizer = load_designer()
+        model = DESIGNER_MODEL
+        tokenizer = DESIGNER_TOKENIZER
 
         user_prompt = _build_prompt(observation)
         chat = [{"role": "user", "content": user_prompt}]
@@ -211,15 +350,37 @@ async def design_mechanism(observation: dict):
         if j_start >= 0 and j_end > j_start:
             try:
                 mech = json.loads(completion[j_start:j_end])
-                return mech
-            except json.JSONDecodeError:
-                pass
+                if isinstance(mech, dict):
+                    return {
+                        "mechanism": mech,
+                        "source": "ai",
+                        "status": "ready",
+                        "error": None,
+                    }
+            except json.JSONDecodeError as je:
+                return {
+                    "mechanism": _DEFAULT_MECHANISM,
+                    "source": "fallback",
+                    "status": "ready",
+                    "error": f"AI returned malformed JSON: {je}",
+                }
+
+        return {
+            "mechanism": _DEFAULT_MECHANISM,
+            "source": "fallback",
+            "status": "ready",
+            "error": "AI completion contained no JSON object.",
+        }
 
     except Exception as e:
-        print(f"[designer] AI generation unavailable (likely still training): {e}")
-
-    # Graceful fallback to a robust default mechanism
-    return _DEFAULT_MECHANISM
+        traceback.print_exc()
+        print(f"[designer] inference failed: {e}")
+        return {
+            "mechanism": _DEFAULT_MECHANISM,
+            "source": "fallback",
+            "status": "error",
+            "error": f"{type(e).__name__}: {e}",
+        }
 
 
 @app.get("/state")
@@ -233,7 +394,12 @@ async def state(session_id: str = "default") -> dict:
 @app.get("/health")
 async def health():
     """Health check."""
-    return {"status": "ok", "environment": "daedalus", "version": "1.0.0"}
+    return {
+        "status": "ok",
+        "environment": "daedalus",
+        "version": "1.0.0",
+        "designer": DESIGNER_STATUS["status"],
+    }
 
 
 # Serve static demo files

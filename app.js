@@ -11,6 +11,8 @@ let S = null; // Simulation state
 let autoId = null;
 let charts = {};
 let aiMode = false;
+let designerStatus = { status: 'idle', error: null }; // populated from /api/designer/status
+let designerPollId = null;
 
 // ── Tab Switching ────────────────────────────────────
 function switchTab(id) {
@@ -24,14 +26,96 @@ function switchTab(id) {
 
 function toggleAIMode() {
   aiMode = !aiMode;
-  const btn = document.getElementById('btn-ai-mode');
-  const dot = document.getElementById('ai-status-dot');
   if (aiMode) {
-    btn.innerHTML = `<span id="ai-status-dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--cyan); margin-right:8px; box-shadow: 0 0 8px var(--cyan);"></span> AI Active`;
-    btn.classList.add('active-ai');
+    // Kick the backend to start downloading/loading immediately if it hasn't.
+    fetch('/api/designer/warmup', { method: 'POST' })
+      .then(r => r.json())
+      .then(s => { designerStatus = s; renderDesignerStatus(); })
+      .catch(() => {});
+    startDesignerPolling();
   } else {
-    btn.innerHTML = `<span id="ai-status-dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--t4); margin-right:8px;"></span> Enable AI Mode`;
-    btn.classList.remove('active-ai');
+    stopDesignerPolling();
+  }
+  renderDesignerStatus();
+}
+
+function renderDesignerStatus() {
+  const btn = document.getElementById('btn-ai-mode');
+  const sub = document.getElementById('ai-status-sub');
+  if (!btn) return;
+
+  const s = designerStatus.status || 'idle';
+  let dotColor = 'var(--t4)';
+  let label = 'Enable AI Mode';
+  let glow = '';
+  let cls = '';
+
+  if (!aiMode) {
+    label = 'Enable AI Mode';
+    dotColor = s === 'ready' ? 'var(--emerald)' : (s === 'loading' ? 'var(--amber)' : (s === 'error' ? 'var(--rose)' : 'var(--t4)'));
+  } else if (s === 'ready') {
+    label = 'AI Active';
+    dotColor = 'var(--cyan)';
+    glow = ' box-shadow: 0 0 8px var(--cyan);';
+    cls = 'active-ai';
+  } else if (s === 'loading') {
+    label = 'AI Loading...';
+    dotColor = 'var(--amber)';
+    glow = ' box-shadow: 0 0 8px var(--amber);';
+    cls = 'active-ai';
+  } else if (s === 'error') {
+    label = 'AI Error - retry';
+    dotColor = 'var(--rose)';
+    cls = 'active-ai';
+  } else {
+    label = 'AI Starting...';
+    dotColor = 'var(--amber)';
+    cls = 'active-ai';
+  }
+
+  btn.innerHTML = `<span id="ai-status-dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; background:${dotColor}; margin-right:8px;${glow}"></span> ${label}`;
+  btn.classList.toggle('active-ai', !!cls);
+
+  if (sub) {
+    if (s === 'ready') {
+      sub.textContent = `Connected: ${designerStatus.adapter || 'kabilesh-c/daedalus-designer'}`;
+      sub.style.color = 'var(--emerald)';
+    } else if (s === 'loading') {
+      sub.textContent = 'Downloading base model + LoRA adapter...';
+      sub.style.color = 'var(--amber)';
+    } else if (s === 'error') {
+      sub.textContent = `Load failed: ${designerStatus.error || 'unknown'}`;
+      sub.style.color = 'var(--rose)';
+    } else {
+      sub.textContent = 'Using kabilesh-c/daedalus-designer';
+      sub.style.color = 'var(--t4)';
+    }
+  }
+}
+
+async function pollDesignerStatus() {
+  try {
+    const r = await fetch('/api/designer/status');
+    designerStatus = await r.json();
+  } catch (e) {
+    designerStatus = { status: 'error', error: 'Server unreachable' };
+  }
+  renderDesignerStatus();
+  if (designerStatus.status === 'ready' || designerStatus.status === 'error') {
+    stopDesignerPolling();
+  }
+}
+
+function startDesignerPolling() {
+  if (designerPollId) return;
+  pollDesignerStatus();
+  designerPollId = setInterval(pollDesignerStatus, 2000);
+}
+
+function stopDesignerPolling() {
+  if (designerPollId) {
+    clearInterval(designerPollId);
+    designerPollId = null;
   }
 }
 
@@ -99,9 +183,9 @@ async function stepSim() {
   if (!S || S.round >= MAX_ROUNDS) return;
   
   let m;
+  let mechSource = 'manual';
   if (aiMode) {
-    // 🧠 Using the AI Designer back-end
-    const obs = { 
+    const obs = {
         round_number: S.round,
         market_outcomes: S.hist.w.map((w, i) => ({
             welfare_ratio: w,
@@ -116,15 +200,29 @@ async function stepSim() {
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(obs)
         });
-        m = await res.json();
-        applyMechToUI(m); // Reflect AI choice in the sliders
+        const payload = await res.json();
+        // New response shape: {mechanism, source, status, error}
+        // Old shape (raw mechanism object) is also tolerated.
+        const aiMech = payload && payload.mechanism ? payload.mechanism : payload;
+        mechSource = (payload && payload.source) || 'ai';
+        if (payload && payload.status) {
+          designerStatus = { status: payload.status, error: payload.error };
+          renderDesignerStatus();
+          if (payload.status === 'loading') startDesignerPolling();
+        }
+        m = { ...readMech(), ...mapAiMechToUiKeys(aiMech) };
+        applyMechToUI(aiMech);
     } catch (e) {
-        console.error("AI Mode failed, falling back to manual:", e);
+        console.error("AI Mode request failed:", e);
+        designerStatus = { status: 'error', error: String(e) };
+        renderDesignerStatus();
         m = readMech();
+        mechSource = 'fallback';
     }
   } else {
     m = readMech();
   }
+  S.lastSource = mechSource;
 
   S.mech = m;
   S.round++;
@@ -231,7 +329,8 @@ async function stepSim() {
   updateMetrics();
   updateCharts();
   updateTimeline(m);
-  document.getElementById('round-badge').textContent = `Round ${S.round} / ${MAX_ROUNDS}`;
+  const srcTag = S.lastSource === 'ai' ? '  [AI]' : (S.lastSource === 'fallback' ? '  [fallback]' : '');
+  document.getElementById('round-badge').textContent = `Round ${S.round} / ${MAX_ROUNDS}${srcTag}`;
   document.getElementById('comp-badge').textContent = `R = ${met.c.toFixed(3)}`;
   document.getElementById('comp-badge').style.color = met.c > 0.3 ? 'var(--emerald)' : met.c > 0.1 ? 'var(--amber)' : 'var(--rose)';
 }
@@ -422,6 +521,23 @@ function renderTimeline() {
 function togChip(el) { el.classList.toggle('active'); }
 function onCtrlChange() { /* applied on next step */ }
 
+function mapAiMechToUiKeys(m) {
+  if (!m) return {};
+  const out = {};
+  if (m.auction_type) out.auction = m.auction_type;
+  if (m.reserve_price !== undefined) out.reserve = m.reserve_price;
+  if (m.reveal_reserve !== undefined) out.revReserve = !!m.reveal_reserve;
+  if (m.reveal_clearing_price !== undefined) out.revClearing = !!m.reveal_clearing_price;
+  if (m.reveal_winner_identity !== undefined) out.revWinner = !!m.reveal_winner_identity;
+  if (m.reveal_competing_bids !== undefined) out.revBids = !!m.reveal_competing_bids;
+  if (m.reveal_bid_distribution !== undefined) out.revDist = !!m.reveal_bid_distribution;
+  if (m.shill_penalty !== undefined) out.penShill = m.shill_penalty;
+  if (m.withdrawal_penalty !== undefined) out.penWithdraw = m.withdrawal_penalty;
+  if (m.collusion_penalty !== undefined) out.penCollusion = m.collusion_penalty;
+  if (m.coalition_policy) out.coalition = m.coalition_policy;
+  return out;
+}
+
 function applyMechToUI(m) {
   if (!m) return;
   if (m.auction_type) document.getElementById('ctrl-auction').value = m.auction_type;
@@ -476,4 +592,8 @@ function resetSim() {
 document.addEventListener('DOMContentLoaded', () => {
   initSim();
   window.addEventListener('resize', () => setTimeout(resizeCharts, 100));
+  // Show server-side designer status from the start so the user sees
+  // whether the model is downloading / ready / errored.
+  pollDesignerStatus();
+  startDesignerPolling();
 });

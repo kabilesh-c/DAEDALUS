@@ -3,7 +3,10 @@
 Public API:
 
 OpenEnv-compliant (preferred for training, evaluation, judges):
-    from daedalus import DaedalusOpenEnv, DaedalusAction, DaedalusObservation, DaedalusState
+    from daedalus import (
+        DaedalusOpenEnv, DaedalusAction, DaedalusObservation, 
+        DaedalusState, DaedalusEnvClient
+    )
 
 Legacy tuple-returning API (for the demo dashboard and old notebooks):
     from daedalus import DaedalusEnvironment
@@ -14,6 +17,7 @@ from .models import MechanismConfig, MarketOutcome, AgentState
 
 try:
     from .openenv_env import DaedalusOpenEnv
+    from .openenv_client import DaedalusEnvClient
     from .openenv_models import (
         DaedalusAction,
         DaedalusObservation,
@@ -36,6 +40,7 @@ __all__ = [
 if _OPENENV_AVAILABLE:
     __all__ += [
         "DaedalusOpenEnv",
+        "DaedalusEnvClient",
         "DaedalusAction",
         "DaedalusObservation",
         "DaedalusState",

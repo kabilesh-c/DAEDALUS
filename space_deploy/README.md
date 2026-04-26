@@ -8,26 +8,31 @@ pinned: false
 hardware: t4-medium
 ---
 
-# DAEDALUS Training Space (v3)
+# DAEDALUS Training Space (v4)
 
-One-shot Docker Space that trains the DAEDALUS mechanism designer
-on a T4 GPU using a robust three-step pipeline:
+One-shot Docker Space that trains the DAEDALUS mechanism designer on a T4
+GPU using a streamlined Unsloth + Qwen pipeline:
 
-1. **SFT warmup** on `Qwen/Qwen2.5-0.5B-Instruct` with synthetic
-   `(prompt, valid mechanism JSON)` pairs - teaches the JSON output format.
-2. **Merge step** - bake the SFT LoRA into the base weights via
-   `merge_and_unload()`. This avoids the `AutoPeftModel` "frozen
-   adapter" trap that broke GRPO at step 0 in earlier versions.
-3. **GRPO refinement** with a fresh LoRA (passed to `GRPOTrainer` via
-   `peft_config`, so TRL handles `requires_grad` correctly by
-   construction) and a format-shaped reward.
+1. **Load** `unsloth/Qwen2.5-0.5B-Instruct-bnb-4bit` (pre-quantized for
+   ~2x faster startup vs on-the-fly bnb).
+2. **Attach a single LoRA** (rank 16, all attention + MLP modules,
+   `use_gradient_checkpointing="unsloth"`).
+3. **SFT phase** - teach the JSON output format on synthetic
+   `(prompt, valid mechanism)` pairs.
+4. **GRPO phase** - reinforce with the same LoRA using a multiplicative
+   reward (format + welfare + fairness + composite).
+5. **Merge & push** - the LoRA is merged into the base and the **full
+   16-bit model** is pushed to `kabilesh-c/daedalus-designer` so any
+   consumer can load it with one line:
 
-Look for the sentinel line `[grpo v3] using merge+fresh-adapter approach`
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+m = AutoModelForCausalLM.from_pretrained("kabilesh-c/daedalus-designer")
+t = AutoTokenizer.from_pretrained("kabilesh-c/daedalus-designer")
+```
+
+Look for the sentinel line `[grpo v4] using single-adapter (no merge) approach`
 in container logs to confirm the new code is live.
 
-The trained LoRA adapter and `training_history.json` are pushed to
-[`kabilesh-c/daedalus-designer`](https://huggingface.co/kabilesh-c/daedalus-designer)
-and the Space auto-pauses on completion.
-
 Mode is controlled by the `TRAIN_MODE` Space variable
-(default: `short`, ~10-15 min training; `long` ~45-60 min).
+(default: `short`, ~8-12 min training on T4; `long` ~30-45 min).
