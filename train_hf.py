@@ -104,7 +104,7 @@ def make_env(stage: int = 0) -> DaedalusEnvironment:
 TRAIN_MODE = os.environ.get("TRAIN_MODE", "short").lower()
 # We load the unsloth pre-quantized variant for 2x faster startup, but the
 # resulting LoRA is fully compatible with the upstream `Qwen/Qwen2.5-0.5B-Instruct`.
-MODEL_ID = os.environ.get("BASE_MODEL", "unsloth/Qwen2.5-0.5B-Instruct-bnb-4bit")
+MODEL_ID = os.environ.get("BASE_MODEL", "unsloth/Qwen2.5-1.5B-Instruct-bnb-4bit")
 HUB_REPO = os.environ.get("HUB_MODEL_ID", "kabilesh-c/daedalus-designer")
 PUSH_MERGED = os.environ.get("PUSH_MERGED", "1") not in ("0", "false", "False")
 
@@ -125,10 +125,10 @@ elif TRAIN_MODE == "smoke":
     GRPO_STEPS = 4
 else:
     # "short" - quick but useful training (~8-12 min on T4).
+    GRPO_STEPS = int(os.environ.get("GRPO_STEPS", 150))
+    N_GRPO_PROMPTS = int(os.environ.get("N_GRPO_PROMPTS", GRPO_STEPS))
     N_SFT_EXAMPLES = 160
     SFT_EPOCHS = 1
-    N_GRPO_PROMPTS = 96
-    GRPO_STEPS = 60
 
 OUT_DIR = "./daedalus-lora"
 MAX_SEQ_LEN = 1024  # mechanism prompts + JSON completions easily fit in 1k
