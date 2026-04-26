@@ -38,10 +38,13 @@ run([
     "-q",
 ])
 
-# ── Step 2: Unsloth alone ─────────────────────────────────────────────────
-print("\n[step 2/3] Installing unsloth...")
+# ── Step 2: Unsloth + unsloth_zoo ────────────────────────────────────────
+# unsloth_zoo is a required companion package that the git install does not
+# pull in automatically — must be installed explicitly before importing unsloth.
+print("\n[step 2/3] Installing unsloth + unsloth_zoo...")
 run([
     sys.executable, "-m", "pip", "install",
+    "unsloth_zoo",
     "unsloth @ git+https://github.com/unslothai/unsloth.git",
     "-q",
 ])
