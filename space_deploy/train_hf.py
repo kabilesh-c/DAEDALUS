@@ -52,11 +52,20 @@ else:
 
 
 # -------------------------------------------------------------------
-# Unsloth & TRL Patching (must happen before TRL import)
+# Unsloth import (must happen before TRL import so unsloth can patch).
+# Note: PatchFastRL("grpo", ...) is intentionally NOT called - the current
+# unsloth release prints "Unsloth for GRPO is not yet implemented!" and the
+# call is a no-op. unsloth still applies its core speedups via
+# FastLanguageModel.from_pretrained / get_peft_model below.
 # -------------------------------------------------------------------
-from unsloth import FastLanguageModel, PatchFastRL  # noqa: E402
+from unsloth import FastLanguageModel  # noqa: E402
 
-PatchFastRL("grpo", "unsloth/Qwen2.5-0.5B-Instruct-bnb-4bit")
+import torch  # noqa: E402
+
+# T4 (compute 7.5) only supports fp16; Ampere+ (compute 8.0+) supports bf16.
+USE_BF16 = bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+USE_FP16 = bool(torch.cuda.is_available() and not USE_BF16)
+print(f"[precision] bf16={USE_BF16} fp16={USE_FP16} cuda={torch.cuda.is_available()}")
 
 
 # -------------------------------------------------------------------
@@ -67,23 +76,26 @@ for candidate in (SCRIPT_DIR, "/workspace", "/app"):
     if os.path.isdir(os.path.join(candidate, "daedalus")) and candidate not in sys.path:
         sys.path.insert(0, candidate)
 
-try:
-    from daedalus import DaedalusOpenEnv, DaedalusAction  # noqa: E402
-    USE_OPENENV = True
-except Exception as _exc:  # noqa: BLE001
-    print(f"[env] error loading DaedalusOpenEnv: {_exc}")
-    USE_OPENENV = False
+# Training doesn't need OpenEnv compliance - the legacy `DaedalusEnvironment`
+# does the same simulation and has no external dependencies (so this trainer
+# doesn't blow up if `openenv-core` import fails on the Space).
+from daedalus.env import DaedalusEnvironment  # noqa: E402
 
 
 def _to_dict(obs: Any) -> dict:
-    if isinstance(obs, dict): return obs
-    if hasattr(obs, "model_dump"): return obs.model_dump()
-    if hasattr(obs, "to_dict"): return obs.to_dict()
+    if obs is None:
+        return {}
+    if isinstance(obs, dict):
+        return obs
+    if hasattr(obs, "model_dump"):
+        return obs.model_dump()
+    if hasattr(obs, "to_dict"):
+        return obs.to_dict()
     return dict(obs)
 
 
-def make_env(stage: int = 0) -> Any:
-    return DaedalusOpenEnv(curriculum_stage=stage)
+def make_env(stage: int = 0) -> DaedalusEnvironment:
+    return DaedalusEnvironment(curriculum_stage=stage)
 
 
 # -------------------------------------------------------------------
@@ -198,9 +210,9 @@ def generate_sft_examples(n: int) -> List[Dict[str, Any]]:
                         {"role": "assistant", "content": json.dumps(mech)},
                     ]
                 })
-                obs = env.step(DaedalusAction(**mech))
-                obs_dict = _to_dict(obs)
-                if obs.done:
+                obs_dict, _, done, _ = env.step(mech)
+                obs_dict = _to_dict(obs_dict)
+                if done:
                     break
     return pairs[:n]
 
@@ -214,9 +226,9 @@ def generate_grpo_prompts(n: int) -> List[Dict[str, str]]:
             obs_dict = _to_dict(env.reset())
             prompts.append({"prompt": format_prompt(obs_dict)})
             for _ in range(3):
-                obs = env.step(DaedalusAction(**random_valid_mechanism()))
-                prompts.append({"prompt": format_prompt(_to_dict(obs))})
-                if obs.done:
+                obs_dict, _, done, _ = env.step(random_valid_mechanism())
+                prompts.append({"prompt": format_prompt(_to_dict(obs_dict))})
+                if done:
                     break
     return prompts[:n]
 
@@ -224,11 +236,41 @@ def generate_grpo_prompts(n: int) -> List[Dict[str, str]]:
 # -------------------------------------------------------------------
 # Decomposed Reward Functions
 # -------------------------------------------------------------------
-_reward_env = make_env()
+# Lazy-init: any failure surfaces inside main(), not at import time.
+_reward_env: Optional[DaedalusEnvironment] = None
+
+
+def _get_reward_env() -> DaedalusEnvironment:
+    global _reward_env
+    if _reward_env is None:
+        _reward_env = make_env()
+    return _reward_env
+
+
+def _completion_text(c: Any) -> str:
+    """Normalize a TRL completion into a plain string.
+
+    TRL passes completions as either:
+      * `str`                             (legacy)
+      * `[{"role": "assistant", "content": "..."}]` (chat-template path)
+    """
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list) and c:
+        last = c[-1]
+        if isinstance(last, dict):
+            return str(last.get("content", ""))
+    if isinstance(c, dict):
+        return str(c.get("content", c))
+    return str(c)
 
 
 @functools.lru_cache(maxsize=256)
 def _get_env_outcome(text: str) -> Optional[dict]:
+    """Run a single step against the env using the JSON inside `text`.
+
+    Returns a dict like {obs, reward, done, info} or None on parse failure.
+    """
     j_start = text.find("{")
     j_end = text.rfind("}") + 1
     if j_start < 0 or j_end <= j_start:
@@ -237,16 +279,23 @@ def _get_env_outcome(text: str) -> Optional[dict]:
         mech = json.loads(text[j_start:j_end])
         if not isinstance(mech, dict):
             return None
-        _reward_env.reset()
-        obs = _reward_env.step(DaedalusAction(**mech))
-        return _to_dict(obs)
+        env = _get_reward_env()
+        env.reset()
+        obs_dict, reward, done, info = env.step(mech)
+        return {
+            "obs": _to_dict(obs_dict),
+            "reward": float(reward),
+            "done": bool(done),
+            "info": dict(info or {}),
+        }
     except Exception:
         return None
 
 
-def reward_format(completions, **kwargs) -> List[float]:
+def reward_format(completions=None, **kwargs) -> List[float]:
     rewards = []
-    for content in completions:
+    for raw in (completions or []):
+        content = _completion_text(raw)
         j_start = content.find("{")
         j_end = content.rfind("}") + 1
         if j_start < 0 or j_end <= j_start:
@@ -254,6 +303,9 @@ def reward_format(completions, **kwargs) -> List[float]:
             continue
         try:
             mech = json.loads(content[j_start:j_end])
+            if not isinstance(mech, dict):
+                rewards.append(-0.5)
+                continue
             coverage = len(set(mech.keys()) & REQUIRED_KEYS) / len(REQUIRED_KEYS)
             rewards.append(0.5 + 0.5 * coverage)
         except Exception:
@@ -261,32 +313,40 @@ def reward_format(completions, **kwargs) -> List[float]:
     return rewards
 
 
-def reward_welfare(completions, **kwargs) -> List[float]:
+def reward_welfare(completions=None, **kwargs) -> List[float]:
     out = []
-    for c in completions:
-        outcome = _get_env_outcome(c)
-        if outcome and "metadata" in outcome:
-            out.append(float(outcome["metadata"].get("welfare_ratio", 0.0)))
+    for raw in (completions or []):
+        outcome = _get_env_outcome(_completion_text(raw))
+        if outcome:
+            info = outcome.get("info") or {}
+            out.append(float(info.get("welfare_ratio", 0.0)))
         else:
             out.append(0.0)
     return out
 
 
-def reward_fairness(completions, **kwargs) -> List[float]:
+def reward_fairness(completions=None, **kwargs) -> List[float]:
     out = []
-    for c in completions:
-        outcome = _get_env_outcome(c)
-        if outcome and "metadata" in outcome:
-            out.append(float(outcome["metadata"].get("stability_score", 0.0)))
+    for raw in (completions or []):
+        outcome = _get_env_outcome(_completion_text(raw))
+        if outcome:
+            info = outcome.get("info") or {}
+            # Prefer explicit stability if reported; otherwise derive fairness from gini.
+            if "stability_score" in info:
+                out.append(float(info["stability_score"]))
+            elif "gini_coefficient" in info:
+                out.append(float(1.0 - info["gini_coefficient"]))
+            else:
+                out.append(0.0)
         else:
             out.append(0.0)
     return out
 
 
-def reward_composite(completions, **kwargs) -> List[float]:
+def reward_composite(completions=None, **kwargs) -> List[float]:
     out = []
-    for c in completions:
-        outcome = _get_env_outcome(c)
+    for raw in (completions or []):
+        outcome = _get_env_outcome(_completion_text(raw))
         if outcome:
             out.append(float(outcome.get("reward", 0.0)))
         else:
@@ -307,6 +367,8 @@ def build_model_and_tokenizer():
         dtype=None,  # let unsloth choose bf16/fp16
     )
     print("[model] attaching LoRA (r=16, all attn + MLP)...")
+    # lora_dropout MUST be 0 to unlock Unsloth's fast LoRA path; otherwise
+    # Unsloth prints "performance hit" and does NOT patch QKV/O/MLP layers.
     model = FastLanguageModel.get_peft_model(
         model,
         r=16,
@@ -315,7 +377,7 @@ def build_model_and_tokenizer():
             "gate_proj", "up_proj", "down_proj",
         ],
         lora_alpha=32,
-        lora_dropout=0.05,
+        lora_dropout=0,
         bias="none",
         use_gradient_checkpointing="unsloth",
         random_state=42,
@@ -338,18 +400,21 @@ def run_sft(model, tokenizer):
         gradient_accumulation_steps=2,
         learning_rate=2e-4,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.05,
+        warmup_steps=5,
         logging_steps=5,
         save_strategy="no",
-        bf16=True,
+        bf16=USE_BF16,
+        fp16=USE_FP16,
         max_seq_length=MAX_SEQ_LEN,
         report_to="none",
         seed=42,
     )
 
+    # Modern TRL (>=0.13) removed/deprecated `tokenizer=` in favor of
+    # `processing_class=`. Use the new name to avoid a TypeError on the Space.
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         train_dataset=dataset,
         args=cfg,
     )
@@ -370,18 +435,23 @@ def run_grpo(model, tokenizer):
     print(f"[grpo] generating {N_GRPO_PROMPTS} prompts ...")
     dataset = Dataset.from_list(generate_grpo_prompts(N_GRPO_PROMPTS))
 
+    grpo_warmup = max(1, GRPO_STEPS // 10)
     cfg = GRPOConfig(
         output_dir=OUT_DIR,
         max_steps=GRPO_STEPS,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=2,
         num_generations=4,
-        max_completion_length=192,
+        # 192 was too tight: the full mechanism JSON spans ~200-280 tokens
+        # so completions were getting truncated -> reward_format returned -1
+        # every time -> GRPO had nothing to learn from. 320 is comfortable.
+        max_completion_length=320,
         learning_rate=1e-5,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.1,
+        warmup_steps=grpo_warmup,
         logging_steps=2,
-        bf16=True,
+        bf16=USE_BF16,
+        fp16=USE_FP16,
         report_to="none",
         seed=42,
     )
@@ -419,15 +489,17 @@ def push_to_hub(model, tokenizer):
                 tokenizer,
                 save_method="merged_16bit",
                 token=HF_TOKEN,
+                private=False,
             )
             print(f"[done] merged model live at https://huggingface.co/{HUB_REPO}")
             return
         except Exception as e:
+            traceback.print_exc()
             print(f"[push] merged upload failed ({e}); falling back to LoRA-only push")
 
     print(f"[push] uploading LoRA adapter to {HUB_REPO} ...")
-    model.push_to_hub(HUB_REPO, token=HF_TOKEN)
-    tokenizer.push_to_hub(HUB_REPO, token=HF_TOKEN)
+    model.push_to_hub(HUB_REPO, token=HF_TOKEN, private=False)
+    tokenizer.push_to_hub(HUB_REPO, token=HF_TOKEN, private=False)
     print(f"[done] adapter live at https://huggingface.co/{HUB_REPO}")
 
 
