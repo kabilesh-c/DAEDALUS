@@ -34,5 +34,10 @@ t = AutoTokenizer.from_pretrained("kabilesh-c/daedalus-designer")
 Look for the sentinel line `[grpo v4] using single-adapter (no merge) approach`
 in container logs to confirm the new code is live.
 
-Mode is controlled by the `TRAIN_MODE` Space variable
-(default: `short`, ~8-12 min training on T4; `long` ~30-45 min).
+Mode is controlled by the `TRAIN_MODE` Space variable:
+
+| `TRAIN_MODE` | SFT examples | GRPO steps | Wall time (T4) | Use case                          |
+|--------------|--------------|------------|----------------|-----------------------------------|
+| `smoke`      | 24           | 4          | ~3-5 min       | shake out build/runtime errors    |
+| `short`      | 160          | 60         | ~8-12 min      | usable model                      |
+| `long`       | 400          | 160        | ~30-45 min     | best results                      |

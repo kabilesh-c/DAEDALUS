@@ -45,7 +45,7 @@ load_dotenv()
 
 REPO_ID = os.environ.get("DAEDALUS_TRAINING_SPACE", "kabilesh-c/daedalus-training-space")
 HARDWARE = os.environ.get("DAEDALUS_HARDWARE", "t4-medium")
-TRAIN_MODE = os.environ.get("DAEDALUS_TRAIN_MODE", "short")
+TRAIN_MODE = os.environ.get("DAEDALUS_TRAIN_MODE", "smoke")
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
 if not HF_TOKEN:
@@ -136,8 +136,13 @@ t = AutoTokenizer.from_pretrained("kabilesh-c/daedalus-designer")
 Look for the sentinel line `[grpo v4] using single-adapter (no merge) approach`
 in container logs to confirm the new code is live.
 
-Mode is controlled by the `TRAIN_MODE` Space variable
-(default: `short`, ~8-12 min training on T4; `long` ~30-45 min).
+Mode is controlled by the `TRAIN_MODE` Space variable:
+
+| `TRAIN_MODE` | SFT examples | GRPO steps | Wall time (T4) | Use case                          |
+|--------------|--------------|------------|----------------|-----------------------------------|
+| `smoke`      | 24           | 4          | ~3-5 min       | shake out build/runtime errors    |
+| `short`      | 160          | 60         | ~8-12 min      | usable model                      |
+| `long`       | 400          | 160        | ~30-45 min     | best results                      |
 """
 
 

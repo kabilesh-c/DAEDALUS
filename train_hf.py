@@ -97,11 +97,22 @@ HUB_REPO = os.environ.get("HUB_MODEL_ID", "kabilesh-c/daedalus-designer")
 PUSH_MERGED = os.environ.get("PUSH_MERGED", "1") not in ("0", "false", "False")
 
 if TRAIN_MODE == "long":
+    # Real training run.
     N_SFT_EXAMPLES = 400
     SFT_EPOCHS = 2
     N_GRPO_PROMPTS = 240
     GRPO_STEPS = 160
+elif TRAIN_MODE == "smoke":
+    # Minimal end-to-end smoke test: exercises every code path
+    # (load -> SFT -> GRPO -> merge -> push) in ~3-5 min on a T4
+    # so build/dependency/runtime errors surface fast before
+    # committing to a long training run.
+    N_SFT_EXAMPLES = 24
+    SFT_EPOCHS = 1
+    N_GRPO_PROMPTS = 16
+    GRPO_STEPS = 4
 else:
+    # "short" - quick but useful training (~8-12 min on T4).
     N_SFT_EXAMPLES = 160
     SFT_EPOCHS = 1
     N_GRPO_PROMPTS = 96
@@ -442,6 +453,8 @@ def pause_self() -> None:
 
 def main():
     t0 = time.time()
+    print(f"[main] TRAIN_MODE={TRAIN_MODE} "
+          f"(SFT={N_SFT_EXAMPLES}x{SFT_EPOCHS}ep, GRPO={GRPO_STEPS} steps)")
     model, tokenizer = build_model_and_tokenizer()
     model = run_sft(model, tokenizer)
     model = run_grpo(model, tokenizer)
