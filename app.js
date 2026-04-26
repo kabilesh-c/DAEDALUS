@@ -439,11 +439,37 @@ async function stepSim() {
       case 'second_price': case 'vcg': payment = valid.length > 1 ? valid[1].bid : m.reserve; break;
     }
     winner.sur = winner.v - payment;
+    
+    // Apply Withdrawal Penalty (chance of default)
+    const defaultProb = 0.05 / (1 + m.penWithdraw); // Penalty reduces default probability
+    if (Math.random() < defaultProb) {
+      winner.sur -= winner.v * 0.1 + m.penWithdraw * 0.5;
+      aiLog(`   [!] Winner ${winner.n} defaulted! Withdrawal penalty applied.`, 'warn');
+      winner.defauted = true;
+    } else {
+      winner.defauted = false;
+    }
+
     winner.wins++;
     if (winner.t === 'exploiter') winner.bud -= payment;
+    
+    // Apply Collusion Penalty
     if (m.penCollusion > 0 && winner.t === 'colluder') {
       const p = S.agents[winner.partner];
-      if (p && p.on && p.bid < m.reserve * 0.8) winner.sur -= payment * m.penCollusion * 0.3;
+      if (p && p.on && p.bid < m.reserve * 0.8) {
+         const pAmt = payment * m.penCollusion * 0.3;
+         winner.sur -= pAmt;
+         aiLog(`   [!] Collusion detected! ${winner.n} penalized ${pAmt.toFixed(3)}`, 'warn');
+      }
+    }
+
+    // Apply Shill Penalty (to shaders/colluders)
+    if (m.penShill > 0 && (winner.t === 'shader' || winner.t === 'colluder')) {
+       if (Math.random() < 0.15 * m.penShill) {
+          const pAmt = payment * m.penShill * 0.2;
+          winner.sur -= pAmt;
+          aiLog(`   [!] Shill-bidding suspected! ${winner.n} penalized ${pAmt.toFixed(3)}`, 'warn');
+       }
     }
   }
 
@@ -683,6 +709,14 @@ function applyMechToUI(m) {
   if (m.shill_penalty !== undefined) {
     document.getElementById('ctrl-shill').value = m.shill_penalty;
     document.getElementById('sv-shill').textContent = m.shill_penalty.toFixed(1);
+  }
+  if (m.withdrawal_penalty !== undefined) {
+    document.getElementById('ctrl-withdraw').value = m.withdrawal_penalty;
+    document.getElementById('sv-withdraw').textContent = m.withdrawal_penalty.toFixed(1);
+  }
+  if (m.collusion_penalty !== undefined) {
+    document.getElementById('ctrl-collusion').value = m.collusion_penalty;
+    document.getElementById('sv-collusion').textContent = m.collusion_penalty.toFixed(1);
   }
   if (m.coalition_policy) document.getElementById('ctrl-coalition').value = m.coalition_policy;
   
