@@ -23,7 +23,6 @@ from openenv.core.env_server.interfaces import Environment
 
 from .env import DaedalusEnvironment as _LegacyEnv
 from .openenv_models import DaedalusAction, DaedalusObservation, DaedalusState
-from .rubrics import DaedalusCompositeRubric
 
 
 class DaedalusOpenEnv(Environment[DaedalusAction, DaedalusObservation, DaedalusState]):
@@ -73,7 +72,7 @@ class DaedalusOpenEnv(Environment[DaedalusAction, DaedalusObservation, DaedalusS
         curriculum_stage: int = 0,
         **kwargs: Any,
     ):
-        super().__init__(rubric=DaedalusCompositeRubric(), **kwargs)
+        super().__init__()
         self._env = _LegacyEnv(
             n_agents=n_agents,
             episode_length=episode_length,

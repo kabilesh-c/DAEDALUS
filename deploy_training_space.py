@@ -82,7 +82,8 @@ COPY . .
 CMD ["python", "-u", "train_hf.py"]
 """
 
-REQUIREMENTS = """openenv-core>=0.2.3
+REQUIREMENTS = """unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
+openenv-core>=0.2.3
 huggingface_hub>=0.26.0
 hf_transfer>=0.1.8
 transformers>=4.45.0

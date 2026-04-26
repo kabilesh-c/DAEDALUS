@@ -84,7 +84,7 @@ README = """---
 title: DAEDALUS Environment
 emoji: \U0001f3db
 colorFrom: indigo
-colorTo: cyan
+colorTo: blue
 sdk: docker
 app_port: 7860
 pinned: false
