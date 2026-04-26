@@ -167,7 +167,10 @@ class DaedalusOpenEnv(Environment[DaedalusAction, DaedalusObservation, DaedalusS
         done: bool,
         info: Optional[dict] = None,
     ) -> DaedalusObservation:
-        metadata = info or {}
+        # Copy so we don't mutate the caller's dict; add derived keys rubrics need.
+        metadata = dict(info or {})
+        if "gini_coefficient" in metadata and "fairness" not in metadata:
+            metadata["fairness"] = max(0.0, 1.0 - float(metadata["gini_coefficient"]))
         return DaedalusObservation(
             mechanism_config=obs_dict.get("mechanism_config", {}),
             market_outcomes=obs_dict.get("market_outcomes", []),

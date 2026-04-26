@@ -23,10 +23,10 @@ openenv:
   app: "openenv_app:app"
   port: 7860
   hosting:
-    space: "kabilesh-c/daedalus-env"
+    space: "Laksh718/daedalus-env"
     sdk: docker
     hardware: cpu-basic
-  client_install: "pip install git+https://huggingface.co/spaces/kabilesh-c/daedalus-env"
+  client_install: "pip install git+https://huggingface.co/spaces/Laksh718/daedalus-env"
 
 agent:
   type: llm_with_structured_head
@@ -67,8 +67,8 @@ training:
   framework: TRL
   efficiency: PEFT-LoRA
   model: Qwen/Qwen2.5-0.5B-Instruct
-  hub_destination: "kabilesh-c/daedalus-designer"
-  training_space: "kabilesh-c/daedalus-training-space"
+  hub_destination: "Laksh718/daedalus-designer"
+  training_space: "Laksh718/daedalus-training-space"
   lora_rank: 16
   batch_size: 4
   generations_per_state: 4

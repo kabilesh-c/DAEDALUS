@@ -58,7 +58,7 @@ environments: Dict[str, DaedalusEnvironment] = {}
 
 # --- AI Designer Loading ---
 BASE_MODEL_ID = os.environ.get("DAEDALUS_BASE_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
-ADAPTER_ID = os.environ.get("DAEDALUS_ADAPTER", "kabilesh-c/daedalus-designer")
+ADAPTER_ID = os.environ.get("DAEDALUS_ADAPTER", "Laksh718/daedalus-designer")
 
 DESIGNER_MODEL = None
 DESIGNER_TOKENIZER = None
@@ -166,13 +166,14 @@ async def _startup_warmup() -> None:
 
 
 def _build_prompt(observation: dict) -> str:
-    """Mirror train_hf.py::format_prompt so inference matches training."""
+    """Exact mirror of train_hf.py::format_prompt — must stay in sync."""
     lines = [
         "You are a mechanism designer for a market auction system.",
         "Analyze the current market state and design an optimal mechanism.",
         "",
         f"Round: {observation.get('round_number', 0)} / "
         f"{observation.get('episode_length', 50)}",
+        f"Curriculum Stage: {observation.get('curriculum_stage', 0)}",
         "",
         "Your goal is to maximize the composite reward R = W x F x P x S",
     ]
@@ -184,22 +185,33 @@ def _build_prompt(observation: dict) -> str:
                 f"  W={o.get('welfare_ratio', 0):.3f} "
                 f"F={1 - o.get('gini_coefficient', 0):.3f} "
                 f"P={o.get('participation_rate', 1):.3f} "
+                f"S={o.get('stability_score', 1):.3f} "
                 f"R={o.get('composite_reward', 0):.3f}"
             )
+    proxies = observation.get("population_proxies", {})
+    if proxies:
+        lines.extend([
+            "",
+            "Population Signals:",
+            f"  Active Bidders: {proxies.get('active_count', 8)} / {proxies.get('total_agents', 8)}",
+            f"  Bid Correlation (collusion proxy): {proxies.get('bid_correlation', 0):.3f}",
+            f"  Winner Rotation Entropy: {proxies.get('rotation_entropy', 1):.3f}",
+            f"  Dropout Rate: {proxies.get('dropout_rate', 0):.3f}",
+        ])
     lines.extend([
         "",
-        "Respond with ONLY a JSON mechanism configuration with these keys:",
-        "  auction_type        : one of \"first_price\" | \"second_price\" | \"vcg\"",
-        "  reserve_price       : float in [0.0, 0.9]",
-        "  reveal_reserve      : bool",
-        "  reveal_competing_bids   : bool",
-        "  reveal_winner_identity  : bool",
-        "  reveal_clearing_price   : bool",
-        "  reveal_bid_distribution : bool",
-        "  shill_penalty       : float in [0.0, 3.0]",
-        "  withdrawal_penalty  : float in [0.0, 3.0]",
-        "  collusion_penalty   : float in [0.0, 3.0]",
-        "  coalition_policy    : one of \"allow\" | \"restrict\" | \"penalize_suspected\" | \"penalize_confirmed\"",
+        "Respond with ONLY a JSON mechanism configuration with these exact keys:",
+        "  auction_type: \"first_price\" | \"second_price\" | \"vcg\"",
+        "  reserve_price: float [0.0, 0.9]",
+        "  reveal_reserve: bool",
+        "  reveal_competing_bids: bool",
+        "  reveal_winner_identity: bool",
+        "  reveal_clearing_price: bool",
+        "  reveal_bid_distribution: bool",
+        "  shill_penalty: float [0.0, 3.0]",
+        "  withdrawal_penalty: float [0.0, 3.0]",
+        "  collusion_penalty: float [0.0, 3.0]",
+        "  coalition_policy: \"allow\" | \"restrict\" | \"penalize_suspected\" | \"penalize_confirmed\"",
         "",
         "Output strictly a single JSON object, no commentary.",
     ])
@@ -334,7 +346,7 @@ async def design_mechanism(observation: dict) -> dict:
         with torch.no_grad():
             out = model.generate(
                 **inputs,
-                max_new_tokens=200,
+                max_new_tokens=400,   # matches GRPO max_completion_length
                 do_sample=True,
                 temperature=0.7,
                 top_p=0.9,

@@ -5,11 +5,11 @@ This Space hosts the OpenEnv-compliant `DaedalusOpenEnv` over HTTP, so
 judges (and any external user) can connect via the OpenEnv `EnvClient`:
 
     from openenv.core.env_client import EnvClient
-    client = EnvClient(base_url="https://kabilesh-c-daedalus-env.hf.space")
+    client = EnvClient(base_url="https://Laksh718-daedalus-env.hf.space")
     obs = client.reset(seed=42).sync()
 
 This is intentionally separate from the training Space
-(`kabilesh-c/daedalus-training-space`), which is a one-shot trainer
+(`Laksh718/daedalus-training-space`), which is a one-shot trainer
 that auto-pauses on completion. The environment Space is a long-lived
 service (`hardware: cpu-basic` is fine; the env is pure Python).
 
@@ -33,7 +33,7 @@ from huggingface_hub import HfApi
 load_dotenv()
 
 
-REPO_ID = os.environ.get("DAEDALUS_ENV_SPACE", "kabilesh-c/daedalus-env")
+REPO_ID = os.environ.get("DAEDALUS_ENV_SPACE", "Laksh718/daedalus-env")
 HARDWARE = os.environ.get("DAEDALUS_ENV_HARDWARE", "cpu-basic")
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -114,7 +114,7 @@ satisfy.
 ```python
 from openenv.core.env_client import EnvClient
 
-client = EnvClient(base_url="https://kabilesh-c-daedalus-env.hf.space")
+client = EnvClient(base_url="https://Laksh718-daedalus-env.hf.space")
 obs = client.reset(seed=42).sync()
 obs = client.step({
     "auction_type": "second_price",
@@ -128,9 +128,9 @@ print(obs.reward, obs.done)
 ## Trained designer
 
 A LoRA adapter trained against this environment lives at
-[`kabilesh-c/daedalus-designer`](https://huggingface.co/kabilesh-c/daedalus-designer)
+[`Laksh718/daedalus-designer`](https://huggingface.co/Laksh718/daedalus-designer)
 (Qwen2.5-0.5B-Instruct + SFT warmup + GRPO refinement, see the training
-Space [`kabilesh-c/daedalus-training-space`](https://huggingface.co/spaces/kabilesh-c/daedalus-training-space)).
+Space [`Laksh718/daedalus-training-space`](https://huggingface.co/spaces/Laksh718/daedalus-training-space)).
 
 ## OpenEnv API
 
